@@ -225,16 +225,29 @@ class ServiceHealthCog(commands.Cog):
 
     @tasks.loop(seconds=30)  # Default, changed in __init__ from config
     async def health_check_loop(self):
-        """Periodically check all services"""
+        """Periodically check all services.
+
+        Every check is individually guarded. discord.ext.tasks stops a Loop on an
+        unhandled exception, so anything escaping here would silently kill the
+        monitor - which is what happened when the failure path referenced two
+        config attributes that did not exist: the monitor died at the exact moment
+        of the first outage and never checked again until a restart. A monitor that
+        fails quietly is worse than no monitor.
+        """
         now = datetime.now(timezone.utc)
 
-        # Check Plex
-        plex_status, plex_error = await self._check_plex()
-        await self._update_health("plex", plex_status, plex_error, now)
-
-        # Check Tautulli
-        tautulli_status, tautulli_error = await self._check_tautulli()
-        await self._update_health("tautulli", tautulli_status, tautulli_error, now)
+        for name, check in (
+            ("plex", self._check_plex),
+            ("tautulli", self._check_tautulli),
+        ):
+            try:
+                status, error = await check()
+                await self._update_health(name, status, error, now)
+            except Exception as e:
+                logger.error(
+                    f"Health check for {name} raised; monitor continues: {e}",
+                    exc_info=True,
+                )
 
     async def _update_health(self, service_name: str, status: ServiceStatus, error: Optional[str], now: datetime):
         """Update health status and trigger alerts if needed"""

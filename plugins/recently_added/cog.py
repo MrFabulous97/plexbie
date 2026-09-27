@@ -150,8 +150,12 @@ class RecentlyAddedCog(commands.Cog):
 
             # Send with pagination if multiple pages
             if len(embeds) > 1:
-                view = PaginationView(embeds)
-                await interaction.followup.send(embed=embeds[0], view=view)
+                view = PaginationView(embeds, author_id=interaction.user.id)
+                # Keep the message so on_timeout can disable the buttons even if
+                # the user never clicks one.
+                view.message = await interaction.followup.send(
+                    embed=embeds[0], view=view, wait=True
+                )
             else:
                 await interaction.followup.send(embed=embeds[0])
 

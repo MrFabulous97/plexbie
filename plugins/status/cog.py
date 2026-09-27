@@ -12,6 +12,27 @@ from utils.embeds import create_info_embed, create_error_embed
 logger = get_logger(__name__)
 
 
+def _collect_library_counts(plex):
+    """Blocking: (counts by library type, total items). Runs in a worker thread.
+
+    Every attribute here can perform HTTP: sections() lists the libraries and
+    LibrarySection.totalSize issues a request per library. Keeping the whole walk
+    in one thread hop is the point - offloading only sections() still left one
+    blocking request per library on the event loop.
+    """
+    counts = {}
+    total = 0
+    for library in plex.library.sections():
+        try:
+            size = library.totalSize
+        except Exception as e:
+            logger.warning(f"Could not read size of library {library.title}: {e}")
+            continue
+        counts[library.type] = counts.get(library.type, 0) + size
+        total += size
+    return counts, total
+
+
 class StatusCog(commands.Cog):
     """Server status monitoring commands"""
     
@@ -45,14 +66,13 @@ class StatusCog(commands.Cog):
             embed.add_field(name="Platform", value=plex.platform, inline=True)
             embed.add_field(name="Platform Version", value=plex.platformVersion, inline=True)
             
-            # Library counts
-            library_counts = {}
-            total_items = 0
-            
-            for library in await run_blocking(plex.library.sections):
-                count = library.totalSize
-                library_counts[library.type] = library_counts.get(library.type, 0) + count
-                total_items += count
+            # Library counts, gathered in a single thread hop. LibrarySection
+            # .totalSize is a cached_data_property that performs an HTTP request,
+            # so reading it per section in this loop blocked the event loop once
+            # per library even though sections() itself was offloaded.
+            library_counts, total_items = await run_blocking(
+                _collect_library_counts, plex
+            )
             
             embed.add_field(
                 name="Libraries",

@@ -176,6 +176,12 @@ class Config(BaseModel):
     watch_party_channel_id: Optional[int] = Field(default_factory=lambda: _env_int("WATCH_PARTY_CHANNEL_ID"))
     watch_party_credit_interval: int = Field(default_factory=lambda: _env_int_default("WATCH_PARTY_CREDIT_INTERVAL", 300))
     health_check_interval: int = Field(default_factory=lambda: _env_int_default("HEALTH_CHECK_INTERVAL", 300))
+    # Consecutive failed checks before the first outage alert is sent. Referenced
+    # by service_health but previously never declared, so the failure path raised
+    # AttributeError and killed the monitor at the moment of an outage.
+    health_max_failures: int = Field(default_factory=lambda: _env_int_default("HEALTH_MAX_FAILURES", 3))
+    # Minimum seconds between repeat alerts for the same still-down service.
+    health_alert_cooldown: int = Field(default_factory=lambda: _env_int_default("HEALTH_ALERT_COOLDOWN", 1800))
     inactivity_warning_days: int = Field(default_factory=lambda: _env_int_default("INACTIVITY_WARNING_DAYS", 25))
     inactivity_removal_days: int = Field(default_factory=lambda: _env_int_default("INACTIVITY_REMOVAL_DAYS", 30))
 
