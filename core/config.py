@@ -8,15 +8,53 @@ from typing import Optional, Any
 import yaml
 from pydantic import BaseModel, Field, validator
 
+from core.logging import get_logger
 
-def _int_or_none(value: Optional[str]) -> Optional[int]:
-    """Safely coerce environment/YAML values to int or None."""
+logger = get_logger(__name__)
+
+
+def _int_or_none(value: Any, source: Optional[str] = None) -> Optional[int]:
+    """Safely coerce environment/YAML values to int or None.
+
+    Warns when a non-empty value has to be discarded. Silently returning None
+    here meant a typo'd setting (e.g. BOT_OWNER_ID=novaora instead of a Discord
+    snowflake) produced a bot that started perfectly and simply never applied
+    that setting, with nothing in the logs to explain why.
+    """
     if value is None or value == "":
         return None
     try:
         return int(value)
     except (TypeError, ValueError):
+        logger.warning(
+            f"Ignoring invalid integer for {source or 'config value'}: {value!r} "
+            f"- expected a numeric ID. This setting is now INACTIVE."
+        )
         return None
+
+
+def _env_int(name: str) -> Optional[int]:
+    """Read an optional integer env var, warning if it is set but unusable."""
+    return _int_or_none(os.getenv(name), source=name)
+
+
+def _env_int_default(name: str, default: int) -> int:
+    """Read an integer env var with a fallback, warning if set but unusable.
+
+    Previously these used a bare int(os.getenv(...)), which raised ValueError and
+    took the whole bot down on a single typo'd interval - and surfaced only as an
+    opaque "Fatal error" with no mention of which variable was at fault.
+    """
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        logger.warning(
+            f"Ignoring invalid integer for {name}: {raw!r} - falling back to {default}"
+        )
+        return default
 
 
 class Config(BaseModel):
@@ -24,8 +62,8 @@ class Config(BaseModel):
 
     # Discord
     discord_bot_token: str = Field(default_factory=lambda: os.getenv("DISCORD_BOT_TOKEN", ""))
-    guild_id: Optional[int] = Field(default_factory=lambda: _int_or_none(os.getenv("GUILD_ID")))
-    bot_owner_id: Optional[int] = Field(default_factory=lambda: _int_or_none(os.getenv("BOT_OWNER_ID")))
+    guild_id: Optional[int] = Field(default_factory=lambda: _env_int("GUILD_ID"))
+    bot_owner_id: Optional[int] = Field(default_factory=lambda: _env_int("BOT_OWNER_ID"))
 
     # Plex
     plex_url: str = Field(default_factory=lambda: os.getenv("PLEX_URL", "http://localhost:32400"))
@@ -70,7 +108,7 @@ class Config(BaseModel):
     bookshelf_ebook_watch: str = Field(default_factory=lambda: os.getenv("BOOKSHELF_EBOOK_WATCH", "/watch/ebooks"))
     bookshelf_audiobook_library: str = Field(default_factory=lambda: os.getenv("BOOKSHELF_AUDIOBOOK_LIBRARY", "/library/audiobooks"))
     bookshelf_ebook_library: str = Field(default_factory=lambda: os.getenv("BOOKSHELF_EBOOK_LIBRARY", "/library/ebooks"))
-    bookshelf_settle_seconds: int = Field(default_factory=lambda: int(os.getenv("BOOKSHELF_SETTLE_SECONDS", "120")))
+    bookshelf_settle_seconds: int = Field(default_factory=lambda: _env_int_default("BOOKSHELF_SETTLE_SECONDS", 120))
 
     # Redis
     redis_url: Optional[str] = Field(default_factory=lambda: os.getenv("REDIS_URL"))
@@ -82,7 +120,7 @@ class Config(BaseModel):
     log_level: str = Field(default_factory=lambda: os.getenv("LOG_LEVEL", "INFO"))
 
     # Webhook server (for inbound events)
-    webhook_port: int = Field(default_factory=lambda: int(os.getenv("WEBHOOK_PORT", "8080")))
+    webhook_port: int = Field(default_factory=lambda: _env_int_default("WEBHOOK_PORT", 8080))
     webhook_path: str = Field(default_factory=lambda: os.getenv("WEBHOOK_PATH", "/webhook"))
     sonarr_webhook_secret: Optional[str] = Field(default_factory=lambda: os.getenv("SONARR_WEBHOOK_SECRET"))
     radarr_webhook_secret: Optional[str] = Field(default_factory=lambda: os.getenv("RADARR_WEBHOOK_SECRET"))
@@ -95,40 +133,40 @@ class Config(BaseModel):
 
     # ---- Additional config matching original bot features ----
     # Discord resource IDs (stored as int for discord.py)
-    admin_channel_id: Optional[int] = Field(default_factory=lambda: _int_or_none(os.getenv("ADMIN_CHANNEL_ID")))
-    stats_channel_id: Optional[int] = Field(default_factory=lambda: _int_or_none(os.getenv("STATS_CHANNEL_ID")))
-    updates_channel_id: Optional[int] = Field(default_factory=lambda: _int_or_none(os.getenv("UPDATES_CHANNEL_ID")))
-    plex_member_role_id: Optional[int] = Field(default_factory=lambda: _int_or_none(os.getenv("PLEX_MEMBER_ROLE_ID")))
-    required_role_id: Optional[int] = Field(default_factory=lambda: _int_or_none(os.getenv("DISCORD_REQUIRED_ROLE_ID")))
-    webhook_notification_channel: Optional[int] = Field(default_factory=lambda: _int_or_none(os.getenv("WEBHOOK_NOTIFICATION_CHANNEL")))
-    admin_role_id: Optional[int] = Field(default_factory=lambda: _int_or_none(os.getenv("ADMIN_ROLE_ID")))
-    homies_role_id: Optional[int] = Field(default_factory=lambda: _int_or_none(os.getenv("HOMIES_ROLE_ID")))
-    nerd_role_id: Optional[int] = Field(default_factory=lambda: _int_or_none(os.getenv("NERD_ROLE_ID")))
-    dumb_role_id: Optional[int] = Field(default_factory=lambda: _int_or_none(os.getenv("DUMB_ROLE_ID")))
-    welcome_channel_id: Optional[int] = Field(default_factory=lambda: _int_or_none(os.getenv("WELCOME_CHANNEL_ID")))
-    nerd_message_id: Optional[int] = Field(default_factory=lambda: _int_or_none(os.getenv("NERD_MESSAGE_ID")))
-    dumb_cat_emoji_id: Optional[int] = Field(default_factory=lambda: _int_or_none(os.getenv("DUMB_CAT_EMOJI_ID")))
-    nerd_cat_emoji_id: Optional[int] = Field(default_factory=lambda: _int_or_none(os.getenv("NERD_CAT_EMOJI_ID")))
-    you_are_dumb_channel_id: Optional[int] = Field(default_factory=lambda: _int_or_none(os.getenv("YOU_ARE_DUMB_CHANNEL_ID")))
-    forever_dumb_role_id: Optional[int] = Field(default_factory=lambda: _int_or_none(os.getenv("FOREVER_DUMB_ROLE_ID")))
-    forever_dumb_message_id: Optional[int] = Field(default_factory=lambda: _int_or_none(os.getenv("FOREVER_DUMB_MESSAGE_ID")))
-    dumb_family_message_id: Optional[int] = Field(default_factory=lambda: _int_or_none(os.getenv("DUMB_FAMILY_MESSAGE_ID")))
-    nerds_but_dumb_role_id: Optional[int] = Field(default_factory=lambda: _int_or_none(os.getenv("NERDS_BUT_DUMB_ROLE_ID")))
+    admin_channel_id: Optional[int] = Field(default_factory=lambda: _env_int("ADMIN_CHANNEL_ID"))
+    stats_channel_id: Optional[int] = Field(default_factory=lambda: _env_int("STATS_CHANNEL_ID"))
+    updates_channel_id: Optional[int] = Field(default_factory=lambda: _env_int("UPDATES_CHANNEL_ID"))
+    plex_member_role_id: Optional[int] = Field(default_factory=lambda: _env_int("PLEX_MEMBER_ROLE_ID"))
+    required_role_id: Optional[int] = Field(default_factory=lambda: _env_int("DISCORD_REQUIRED_ROLE_ID"))
+    webhook_notification_channel: Optional[int] = Field(default_factory=lambda: _env_int("WEBHOOK_NOTIFICATION_CHANNEL"))
+    admin_role_id: Optional[int] = Field(default_factory=lambda: _env_int("ADMIN_ROLE_ID"))
+    homies_role_id: Optional[int] = Field(default_factory=lambda: _env_int("HOMIES_ROLE_ID"))
+    nerd_role_id: Optional[int] = Field(default_factory=lambda: _env_int("NERD_ROLE_ID"))
+    dumb_role_id: Optional[int] = Field(default_factory=lambda: _env_int("DUMB_ROLE_ID"))
+    welcome_channel_id: Optional[int] = Field(default_factory=lambda: _env_int("WELCOME_CHANNEL_ID"))
+    nerd_message_id: Optional[int] = Field(default_factory=lambda: _env_int("NERD_MESSAGE_ID"))
+    dumb_cat_emoji_id: Optional[int] = Field(default_factory=lambda: _env_int("DUMB_CAT_EMOJI_ID"))
+    nerd_cat_emoji_id: Optional[int] = Field(default_factory=lambda: _env_int("NERD_CAT_EMOJI_ID"))
+    you_are_dumb_channel_id: Optional[int] = Field(default_factory=lambda: _env_int("YOU_ARE_DUMB_CHANNEL_ID"))
+    forever_dumb_role_id: Optional[int] = Field(default_factory=lambda: _env_int("FOREVER_DUMB_ROLE_ID"))
+    forever_dumb_message_id: Optional[int] = Field(default_factory=lambda: _env_int("FOREVER_DUMB_MESSAGE_ID"))
+    dumb_family_message_id: Optional[int] = Field(default_factory=lambda: _env_int("DUMB_FAMILY_MESSAGE_ID"))
+    nerds_but_dumb_role_id: Optional[int] = Field(default_factory=lambda: _env_int("NERDS_BUT_DUMB_ROLE_ID"))
 
     # Watch tracking persistent message IDs
-    now_watching_message_id: Optional[int] = Field(default_factory=lambda: _int_or_none(os.getenv("NOW_WATCHING_MESSAGE_ID")))
-    watch_streak_message_id: Optional[int] = Field(default_factory=lambda: _int_or_none(os.getenv("WATCH_STREAK_MESSAGE_ID")))
-    leaderboard_message_id: Optional[int] = Field(default_factory=lambda: _int_or_none(os.getenv("LEADERBOARD_MESSAGE_ID")))
+    now_watching_message_id: Optional[int] = Field(default_factory=lambda: _env_int("NOW_WATCHING_MESSAGE_ID"))
+    watch_streak_message_id: Optional[int] = Field(default_factory=lambda: _env_int("WATCH_STREAK_MESSAGE_ID"))
+    leaderboard_message_id: Optional[int] = Field(default_factory=lambda: _env_int("LEADERBOARD_MESSAGE_ID"))
 
     # External APIs
     tmdb_api_key: Optional[str] = Field(default_factory=lambda: os.getenv("TMDB_API_KEY"))
 
     # Plugin-specific config
-    watch_party_channel_id: Optional[int] = Field(default_factory=lambda: _int_or_none(os.getenv("WATCH_PARTY_CHANNEL_ID")))
-    watch_party_credit_interval: int = Field(default_factory=lambda: int(os.getenv("WATCH_PARTY_CREDIT_INTERVAL", "300")))
-    health_check_interval: int = Field(default_factory=lambda: int(os.getenv("HEALTH_CHECK_INTERVAL", "300")))
-    inactivity_warning_days: int = Field(default_factory=lambda: int(os.getenv("INACTIVITY_WARNING_DAYS", "25")))
-    inactivity_removal_days: int = Field(default_factory=lambda: int(os.getenv("INACTIVITY_REMOVAL_DAYS", "30")))
+    watch_party_channel_id: Optional[int] = Field(default_factory=lambda: _env_int("WATCH_PARTY_CHANNEL_ID"))
+    watch_party_credit_interval: int = Field(default_factory=lambda: _env_int_default("WATCH_PARTY_CREDIT_INTERVAL", 300))
+    health_check_interval: int = Field(default_factory=lambda: _env_int_default("HEALTH_CHECK_INTERVAL", 300))
+    inactivity_warning_days: int = Field(default_factory=lambda: _env_int_default("INACTIVITY_WARNING_DAYS", 25))
+    inactivity_removal_days: int = Field(default_factory=lambda: _env_int_default("INACTIVITY_REMOVAL_DAYS", 30))
 
     class Config:  # pydantic model config (not the same as this module's class)
         # NOTE: env_file is only respected by pydantic BaseSettings,
@@ -183,7 +221,15 @@ class Config(BaseModel):
                     "watch_streak_message_id",
                     "leaderboard_message_id",
                 }:
-                    coerced = _int_or_none(value) if key != "webhook_port" else int(value)
+                    coerced = _int_or_none(value, source=f"config.yml:{key}")
+                    if coerced is None and key == "webhook_port":
+                        # webhook_port is non-Optional; keep the env/default value
+                        # rather than writing None and failing later at bind time.
+                        logger.warning(
+                            f"config.yml:webhook_port is not a number ({value!r}) - "
+                            f"keeping {self.webhook_port}"
+                        )
+                        continue
                     setattr(self, key, coerced)
                 else:
                     setattr(self, key, value)
