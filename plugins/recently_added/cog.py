@@ -6,11 +6,36 @@ from discord.ext import commands
 from typing import Optional, List
 
 import plexapi.exceptions
+from core.blocking import run_blocking
 from core.logging import get_logger
 from core.services import BotServices
 from utils.embeds import create_media_embed, create_error_embed, PaginationView
 
 logger = get_logger(__name__)
+
+
+def _fetch_section_recently_added(plex, library, limit):
+    """Blocking: recently-added items for one named library section.
+
+    Runs in a worker thread. Both library.section() and recentlyAdded() are
+    separate HTTP round-trips, so they belong in the same thread hop rather than
+    one wrapped call and one left on the loop.
+    """
+    section = plex.library.section(library)
+    return list(section.recentlyAdded(maxresults=limit))
+
+
+def _fetch_all_recently_added(plex, limit):
+    """Blocking: recently-added items across every section, newest first.
+
+    Runs in a worker thread. This is one request to list sections plus one per
+    section, which is exactly the shape that must not run on the event loop.
+    """
+    items = []
+    for section in plex.library.sections():
+        items.extend(section.recentlyAdded(maxresults=limit))
+    items.sort(key=lambda item: item.addedAt, reverse=True)
+    return items[:limit]
 
 
 class RecentlyAddedCog(commands.Cog):
@@ -46,8 +71,9 @@ class RecentlyAddedCog(commands.Cog):
             if library:
                 # Check specific library
                 try:
-                    section = plex.library.section(library)
-                    recent_items = section.recentlyAdded(maxresults=limit)
+                    recent_items = await run_blocking(
+                        _fetch_section_recently_added, plex, library, limit
+                    )
                 except (plexapi.exceptions.NotFound, KeyError) as e:  # Library not found
                     embed = create_error_embed(
                         "Library Not Found",
@@ -57,13 +83,9 @@ class RecentlyAddedCog(commands.Cog):
                     return
             else:
                 # Get from all libraries
-                for section in plex.library.sections():
-                    items = section.recentlyAdded(maxresults=limit)
-                    recent_items.extend(items)
-
-                # Sort by date added and limit
-                recent_items.sort(key=lambda x: x.addedAt, reverse=True)
-                recent_items = recent_items[:limit]
+                recent_items = await run_blocking(
+                    _fetch_all_recently_added, plex, limit
+                )
 
             if not recent_items:
                 embed = create_error_embed(

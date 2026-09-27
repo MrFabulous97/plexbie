@@ -10,6 +10,7 @@ import discord
 from discord.ext import commands, tasks
 from plexapi.server import PlexServer
 
+from core.blocking import run_blocking
 from core.logging import get_logger
 from core.services import BotServices
 
@@ -96,21 +97,24 @@ class ServiceHealthCog(commands.Cog):
             # Try to use existing connection first
             if self.services.plex_server:
                 try:
-                    _ = self.services.plex_server.sessions()
+                    _ = await run_blocking(self.services.plex_server.sessions)
                     return ServiceStatus.HEALTHY, None
                 except Exception as e:
                     logger.debug(f"Plex connection stale, reconnecting: {e}")
                     pass
 
-            # Create new connection (only if no existing or existing failed)
-            plex = PlexServer(
+            # Create new connection (only if no existing or existing failed).
+            # PlexServer() is a blocking handshake; this runs on a 30s task loop,
+            # so an unreachable Plex would otherwise stall the loop each tick.
+            plex = await run_blocking(
+                PlexServer,
                 self.services.config.plex_url,
                 self.services.config.plex_token,
-                timeout=10
+                timeout=10,
             )
 
             # Verify connection with health check
-            _ = plex.sessions()
+            _ = await run_blocking(plex.sessions)
 
             # Update the shared plex_server reference
             self.services.plex_server = plex

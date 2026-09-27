@@ -4,6 +4,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
+from core.blocking import run_blocking
 from core.logging import get_logger
 from core.services import BotServices
 from utils.embeds import create_info_embed, create_error_embed
@@ -48,7 +49,7 @@ class StatusCog(commands.Cog):
             library_counts = {}
             total_items = 0
             
-            for library in plex.library.sections():
+            for library in await run_blocking(plex.library.sections):
                 count = library.totalSize
                 library_counts[library.type] = library_counts.get(library.type, 0) + count
                 total_items += count
@@ -68,7 +69,7 @@ class StatusCog(commands.Cog):
                 )
             
             # Active sessions
-            sessions = plex.sessions()
+            sessions = await run_blocking(plex.sessions)
             embed.add_field(
                 name="Active Streams",
                 value=f"👥 {len(sessions)} user(s) streaming",

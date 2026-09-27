@@ -9,6 +9,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 
+from core.blocking import run_blocking
 from core.logging import get_logger
 from core.services import BotServices
 from database.session import get_session
@@ -17,6 +18,7 @@ from sqlalchemy import select
 from plugins.watch_party.models import WatchPartyCredit
 
 logger = get_logger(__name__)
+
 
 # Storage files
 STREAKS_FILE = Path("config/watch_streaks.json")
@@ -29,6 +31,32 @@ USER_ALIASES_FILE = Path("config/user_aliases.json")
 # For the 10-second "Now Watching" loop, we want the countdown to show ~10 seconds
 # when the message is displayed, so this should be tuned based on observed drift.
 TIMESTAMP_LATENCY_OFFSET = 96
+
+
+def _collect_watched_today(plex):
+    """Blocking: map each Plex account name -> did they watch anything today.
+
+    Runs in a worker thread. One request lists the accounts and one more fetches
+    history per account, so the cost scales with user count - exactly the shape
+    that must not sit on the event loop.
+
+    History rows with no viewedAt are treated as "not today" rather than raising:
+    plexapi can return them, and an AttributeError here used to abort the whole
+    streak pass for every user.
+    """
+    watched = {}
+    today = datetime.now().date()
+    for account in plex.systemAccounts():
+        name = account.name
+        if not name:
+            continue
+        history = plex.history(maxresults=100, accountID=account.id)
+        watched[name] = any(
+            getattr(entry, "viewedAt", None) is not None
+            and entry.viewedAt.date() == today
+            for entry in history
+        )
+    return watched
 
 
 class WatchTrackingCog(commands.Cog):
@@ -226,7 +254,7 @@ class WatchTrackingCog(commands.Cog):
             return
 
         if not self.services.plex_server:
-            self.services.reconnect_plex()
+            await self.services.reconnect_plex()
             if not self.services.plex_server:
                 return
 
@@ -235,7 +263,7 @@ class WatchTrackingCog(commands.Cog):
             await self._refresh_username_cache()
 
             # Get active sessions
-            sessions = self.services.plex_server.sessions()
+            sessions = await run_blocking(self.services.plex_server.sessions)
 
             embed = discord.Embed(
                 title="📺 Now Watching on Plex",
@@ -415,7 +443,7 @@ class WatchTrackingCog(commands.Cog):
     async def update_watch_streaks(self):
         """Calculate watch streaks hourly (background calculation)"""
         if not self.services.plex_server:
-            self.services.reconnect_plex()
+            await self.services.reconnect_plex()
             if not self.services.plex_server:
                 return
 
@@ -429,12 +457,14 @@ class WatchTrackingCog(commands.Cog):
             today = datetime.now().date().isoformat()
             yesterday = (datetime.now() - timedelta(days=1)).date().isoformat()
 
-            # Get all user accounts
-            for user in self.services.plex_server.systemAccounts():
-                username = user.name
-                history = self.services.plex_server.history(maxresults=100, accountID=user.id)
-                watched_today = any(h.viewedAt.date() == datetime.now().date() for h in history)
+            # Gather every account's watch-today flag in a single thread hop.
+            # This is one request to list accounts plus one history request per
+            # account; done inline it stalled the loop for the sum of all of them.
+            watched_by_user = await run_blocking(
+                _collect_watched_today, self.services.plex_server
+            )
 
+            for username, watched_today in watched_by_user.items():
                 if username not in streaks:
                     streaks[username] = {'current': 0, 'longest': 0, 'last_watched': None}
 

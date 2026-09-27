@@ -8,6 +8,7 @@ import redis.asyncio as aioredis
 from plexapi.server import PlexServer
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from core.blocking import run_blocking
 from core.config import Config
 from core.logging import get_logger
 from core.security import redact
@@ -81,12 +82,14 @@ class BotServices:
                 logger.error(f"   ❌ Redis: Unexpected error - {e}", exc_info=True)
                 self.redis_client = None
 
-        # Plex server
+        # Plex server. PlexServer() performs an HTTP handshake, so keep it off
+        # the event loop even during startup.
         if self.config.plex_url and self.config.plex_token:
             try:
-                self.plex_server = PlexServer(
+                self.plex_server = await run_blocking(
+                    PlexServer,
                     self.config.plex_url,
-                    self.config.plex_token
+                    self.config.plex_token,
                 )
                 logger.info(f"   ✅ Plex: Connected to {redact(self.config.plex_url)}")
             except Exception as e:
@@ -105,14 +108,21 @@ class BotServices:
         if integrations:
             logger.info(f"   ✅ Integrations: {', '.join(integrations)}")
 
-    def reconnect_plex(self) -> bool:
-        """Attempt to reconnect to Plex server. Returns True if successful."""
+    async def reconnect_plex(self) -> bool:
+        """Attempt to reconnect to Plex server. Returns True if successful.
+
+        Async because PlexServer() is a blocking HTTP handshake and this is
+        called from task loops that run as often as every 10 seconds - a failing
+        reconnect would otherwise stall the loop for plexapi's 30s timeout on
+        every tick.
+        """
         if not self.config.plex_url or not self.config.plex_token:
             return False
         try:
-            self.plex_server = PlexServer(
+            self.plex_server = await run_blocking(
+                PlexServer,
                 self.config.plex_url,
-                self.config.plex_token
+                self.config.plex_token,
             )
             logger.info(f"Plex: Reconnected to {redact(self.config.plex_url)}")
             return True

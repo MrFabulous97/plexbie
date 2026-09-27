@@ -10,6 +10,7 @@ from discord import app_commands
 from discord.ext import commands, tasks
 from discord.ui import Button, View
 
+from core.blocking import run_blocking
 from core.logging import get_logger
 from core.permissions import AdminOnlyView, require_admin
 from core.services import BotServices
@@ -521,30 +522,14 @@ class MediaCleanupCog(commands.Cog):
             monitor_summary = await self.enforce_request_monitor_cleanup()
             logger.info(f"Request monitor cleanup summary: {monitor_summary}")
 
-            items_to_notify = []
-            items_to_delete = []
-
-            # Get all libraries
-            for library in self.services.plex_server.library.sections():
-                # Skip excluded libraries
-                if library.title in self.config["exclude_libraries"]:
-                    logger.info(f"Skipping excluded library: {library.title}")
-                    continue
-
-                # Only process movie and show libraries
-                if library.type not in ["movie", "show"]:
-                    continue
-
-                logger.info(f"Checking library: {library.title}")
-
-                # Get all items in library
-                for item in library.all():
-                    result = await self.check_item_for_cleanup(item)
-                    if result:
-                        if result["action"] == "notify":
-                            items_to_notify.append(result)
-                        elif result["action"] == "delete":
-                            items_to_delete.append(result)
+            # The whole traversal runs in one worker thread. It is one request to
+            # list sections, one per section to list items, and for every show two
+            # more per season - thousands of blocking round-trips on a real
+            # library. Inline, that froze the event loop (and the Discord
+            # heartbeat) for minutes and triggered gateway reconnects.
+            items_to_notify, items_to_delete = await run_blocking(
+                self._scan_libraries_for_cleanup
+            )
 
             # Send notifications
             if items_to_notify:
@@ -646,8 +631,47 @@ class MediaCleanupCog(commands.Cog):
             logger.debug(f"Could not look up recent media request timestamp for {getattr(item, 'title', '<unknown>')}: {e}")
             return None
 
-    async def check_item_for_cleanup(self, item) -> Optional[Dict]:
-        """Check if an item should be cleaned up"""
+    def _scan_libraries_for_cleanup(self):
+        """Blocking: walk every eligible library and classify each item.
+
+        Runs in a worker thread. Returns (items_to_notify, items_to_delete).
+
+        Kept synchronous end to end so that no plexapi call - including the lazy
+        per-show season/episode requests inside check_item_for_cleanup - can end
+        up back on the event loop.
+        """
+        items_to_notify = []
+        items_to_delete = []
+
+        for library in self.services.plex_server.library.sections():
+            # Skip excluded libraries
+            if library.title in self.config["exclude_libraries"]:
+                logger.info(f"Skipping excluded library: {library.title}")
+                continue
+
+            # Only process movie and show libraries
+            if library.type not in ["movie", "show"]:
+                continue
+
+            logger.info(f"Checking library: {library.title}")
+
+            for item in library.all():
+                result = self.check_item_for_cleanup(item)
+                if result:
+                    if result["action"] == "notify":
+                        items_to_notify.append(result)
+                    elif result["action"] == "delete":
+                        items_to_delete.append(result)
+
+        return items_to_notify, items_to_delete
+
+    def check_item_for_cleanup(self, item) -> Optional[Dict]:
+        """Check if an item should be cleaned up.
+
+        Synchronous on purpose: it performs blocking plexapi calls (item.seasons()
+        and season.episodes() per show) and awaits nothing. Callers must invoke it
+        from inside a worker thread - see _scan_libraries_for_cleanup.
+        """
         try:
             # Get the item's rating key for tracking
             rating_key = str(item.ratingKey)
@@ -762,7 +786,7 @@ class MediaCleanupCog(commands.Cog):
 
                     # Also remove from Plex library (Sonarr/Radarr deletion should trigger this, but be safe)
                     try:
-                        item.delete()
+                        await run_blocking(item.delete)
                     except Exception as e:
                         logger.debug(f"Could not delete from Plex (may already be gone): {e}")
 
@@ -958,7 +982,16 @@ class MediaCleanupCog(commands.Cog):
         return f"{prefix} {title}"
 
     async def _find_media_matches(self, title_query: str, media_type: Optional[str] = None) -> List[Dict]:
-        """Find candidate Plex media items matching a title query"""
+        """Find candidate Plex media items matching a title query."""
+        return await run_blocking(self._find_media_matches_blocking, title_query, media_type)
+
+    def _find_media_matches_blocking(self, title_query: str, media_type: Optional[str] = None) -> List[Dict]:
+        """Blocking: search every eligible library for a title.
+
+        Runs in a worker thread. One request per library section to search, and it
+        already reduces everything to plain dicts, so no lazy plexapi object
+        escapes back to the event loop.
+        """
         matches = []
         normalized_query = title_query.casefold().strip()
 
@@ -1028,30 +1061,13 @@ class MediaCleanupCog(commands.Cog):
             return
 
         monitor_summary = await self.enforce_request_monitor_cleanup()
-        items_to_notify = []
-        items_to_delete = []
 
-        # Get all libraries
-        for library in self.services.plex_server.library.sections():
-            # Skip excluded libraries
-            if library.title in self.config["exclude_libraries"]:
-                logger.info(f"Skipping excluded library: {library.title}")
-                continue
-
-            # Only process movie and show libraries
-            if library.type not in ["movie", "show"]:
-                continue
-
-            logger.info(f"Checking library: {library.title}")
-
-            # Get all items in library
-            for item in library.all():
-                result = await self.check_item_for_cleanup(item)
-                if result:
-                    if result["action"] == "notify":
-                        items_to_notify.append(result)
-                    elif result["action"] == "delete":
-                        items_to_delete.append(result)
+        # Same traversal as the daily loop, off the event loop. This path is
+        # reached from a button click, so blocking here would freeze the bot for
+        # every other user while one admin's scan ran.
+        items_to_notify, items_to_delete = await run_blocking(
+            self._scan_libraries_for_cleanup
+        )
 
         # Send notifications
         if items_to_notify:

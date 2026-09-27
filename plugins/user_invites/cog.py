@@ -10,6 +10,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
+from core.blocking import run_blocking
 from core.logging import get_logger
 from core.permissions import AdminOnlyView
 from core.services import BotServices
@@ -119,17 +120,22 @@ class PlexInviteApprovalView(AdminOnlyView):
                 logger.error("Plex credentials not configured")
                 return False, ""
 
-            account = MyPlexAccount(
+            # MyPlexAccount() authenticates against plex.tv and inviteFriend()
+            # is another round-trip to it; both are blocking, and this runs from a
+            # button callback where a stalled loop delays every other interaction.
+            account = await run_blocking(
+                MyPlexAccount,
                 self.services.config.plex_username,
-                self.services.config.plex_password
+                self.services.config.plex_password,
             )
 
-            sections = self.services.plex_server.library.sections()
-            account.inviteFriend(
+            sections = await run_blocking(self.services.plex_server.library.sections)
+            await run_blocking(
+                account.inviteFriend,
                 user=self.email,
                 server=self.services.plex_server,
                 sections=sections,
-                allowSync=False
+                allowSync=False,
             )
 
             # Extract username from email (username is the part before @)
@@ -142,7 +148,10 @@ class PlexInviteApprovalView(AdminOnlyView):
             message = str(e)
             if "already sharing this server with" in message:
                 try:
-                    existing_user = account.user(self.email)
+                    # account.user() is another plex.tv lookup. account may be
+                    # unbound if MyPlexAccount() itself raised, which the outer
+                    # except also covers.
+                    existing_user = await run_blocking(account.user, self.email)
                 except Exception:
                     existing_user = None
 

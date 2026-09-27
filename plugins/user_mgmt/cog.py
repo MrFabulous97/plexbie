@@ -11,6 +11,7 @@ from discord.ext import commands, tasks
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from core.blocking import run_blocking
 from core.logging import get_logger
 from core.services import BotServices
 from core.admin_mirror import send_user_dm
@@ -343,12 +344,15 @@ class UserMgmtCog(commands.Cog):
             try:
                 from plexapi.myplex import MyPlexAccount
 
-                account = MyPlexAccount(
+                # Both plex.tv calls are blocking; this runs inside the daily
+                # loop, once per user being removed.
+                account = await run_blocking(
+                    MyPlexAccount,
                     self.services.config.plex_username,
-                    self.services.config.plex_password
+                    self.services.config.plex_password,
                 )
                 friend_key = user.plex_email or user.plex_username
-                account.removeFriend(friend_key)
+                await run_blocking(account.removeFriend, friend_key)
                 logger.info(f"Removed {user.plex_username} from Plex server")
             except Exception as e:
                 # Do NOT fall through to the database delete. Dropping the row
@@ -539,7 +543,7 @@ class UserMgmtCog(commands.Cog):
                     return
 
                 # Find Plex user
-                plex_users = self.services.plex_server.systemAccounts()
+                plex_users = await run_blocking(self.services.plex_server.systemAccounts)
                 plex_user = next((u for u in plex_users if u.name == plex_username), None)
 
                 if not plex_user:
@@ -560,12 +564,13 @@ class UserMgmtCog(commands.Cog):
                 try:
                     from plexapi.myplex import MyPlexAccount
 
-                    account = MyPlexAccount(
+                    account = await run_blocking(
+                        MyPlexAccount,
                         self.services.config.plex_username,
-                        self.services.config.plex_password
+                        self.services.config.plex_password,
                     )
                     friend_key = tracked_user.plex_email or plex_username
-                    account.removeFriend(friend_key)
+                    await run_blocking(account.removeFriend, friend_key)
                     logger.info(f"Manually removed {plex_username} from Plex by {interaction.user.name}")
                 except Exception as e:
                     logger.error(f"Error removing {plex_username} from Plex: {e}")
@@ -675,7 +680,7 @@ class UserMgmtCog(commands.Cog):
                 return
 
             # Get Plex users to check for orphans
-            plex_users = self.services.plex_server.systemAccounts() if self.services.plex_server else []
+            plex_users = await run_blocking(self.services.plex_server.systemAccounts) if self.services.plex_server else []
             plex_usernames = {u.name for u in plex_users}
 
             embed = discord.Embed(
@@ -731,7 +736,7 @@ class UserMgmtCog(commands.Cog):
                 return
 
             # Get all Plex users
-            plex_users = self.services.plex_server.systemAccounts()
+            plex_users = await run_blocking(self.services.plex_server.systemAccounts)
 
             embed = discord.Embed(
                 title="📋 All Plex Users",
@@ -802,7 +807,7 @@ class UserMgmtCog(commands.Cog):
                 return
 
             # Get all Plex users
-            plex_users = self.services.plex_server.systemAccounts()
+            plex_users = await run_blocking(self.services.plex_server.systemAccounts)
 
             invalid_users = []
             protected_ids = [1]  # Protect admin account (ID 1)
@@ -1151,7 +1156,7 @@ class LinkUserView(discord.ui.View):
 
         # Look up the Plex username from the Plex server using the ID
         try:
-            plex_users = self.services.plex_server.systemAccounts()
+            plex_users = await run_blocking(self.services.plex_server.systemAccounts)
             plex_user = next((u for u in plex_users if u.id == self.selected_plex_user_id), None)
             if plex_user:
                 self.selected_plex_username = plex_user.name

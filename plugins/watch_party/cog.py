@@ -10,6 +10,7 @@ from discord import app_commands
 from discord.ext import commands, tasks
 from sqlalchemy import select, update
 
+from core.blocking import run_blocking
 from core.logging import get_logger
 from core.services import BotServices
 from database.session import get_session
@@ -121,7 +122,7 @@ class WatchPartyCog(commands.Cog):
             return None
 
         try:
-            sessions = self.services.plex_server.sessions()
+            sessions = await run_blocking(self.services.plex_server.sessions)
             for session in sessions:
                 session_user = session.usernames[0] if session.usernames else None
                 if session_user and session_user.lower() == plex_username.lower():
