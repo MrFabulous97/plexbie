@@ -12,9 +12,11 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.blocking import run_blocking
+from core.permissions import AdminOnlyView
 from core.logging import get_logger
 from core.services import BotServices
 from core.admin_mirror import send_user_dm
+from utils.embeds import truncate_field
 from database.session import get_session
 from .models import PlexUser
 
@@ -23,6 +25,9 @@ logger = get_logger(__name__)
 # Invites file location (shared with user_invites plugin)
 # INVITES_FILE removed - now using database kv_store
 INVITES_NAMESPACE = "plex_invites"
+
+# Discord allows 25 fields per embed.
+MAX_LISTED_USERS = 25
 
 
 class UserMgmtCog(commands.Cog):
@@ -414,7 +419,7 @@ class UserMgmtCog(commands.Cog):
                 if stats_text:
                     embed.add_field(
                         name="📊 Your Stats",
-                        value="\n".join(stats_text),
+                        value=truncate_field("\n".join(stats_text)),
                         inline=False
                     )
 
@@ -553,12 +558,13 @@ class UserMgmtCog(commands.Cog):
                     )
                     return
 
-                # Get user stats before removal
+                # Collect stats up front (the account must still exist in Tautulli),
+                # but do not tell the user anything until the removal has actually
+                # succeeded. The DM is titled "Removed from Plex Server", so sending
+                # it first meant a failed removal left the user believing they had
+                # lost access while they still had it. Same ordering already fixed
+                # in the automatic path, _remove_inactive_user.
                 stats = await self._get_user_stats(plex_username)
-
-                # Send manual removal DM
-                if tracked_user.discord_id:
-                    await self._send_manual_removal_dm(tracked_user, stats, interaction.user.name)
 
                 # Remove from Plex
                 try:
@@ -580,8 +586,9 @@ class UserMgmtCog(commands.Cog):
                     )
                     return
 
-                # Remove Plex role
+                # Removal succeeded - now notify and clean up Discord state.
                 if tracked_user.discord_id:
+                    await self._send_manual_removal_dm(tracked_user, stats, interaction.user.name)
                     await self._remove_plex_role(tracked_user.discord_id)
 
                 # Remove from database
@@ -639,7 +646,7 @@ class UserMgmtCog(commands.Cog):
                 if stats_text:
                     embed.add_field(
                         name="📊 Your Stats",
-                        value="\n".join(stats_text),
+                        value=truncate_field("\n".join(stats_text)),
                         inline=False
                     )
 
@@ -689,15 +696,20 @@ class UserMgmtCog(commands.Cog):
                 color=discord.Color.blue()
             )
 
-            orphaned_count = 0
-            for user in tracked_users[:25]:  # Discord embed field limit
+            # Count orphans across ALL tracked users, not just the visible page -
+            # computing it inside the display loop understated the real number.
+            orphaned_count = sum(
+                1 for user in tracked_users if user.plex_username not in plex_usernames
+            )
+
+            shown = tracked_users[:MAX_LISTED_USERS]
+            for user in shown:
                 discord_info = f"<@{user.discord_id}>" if user.discord_id else "❌ Not linked"
                 status_emoji = "🟢" if user.days_inactive < 25 else "🟡" if user.days_inactive < 30 else "🔴"
 
                 # Check if orphaned
                 is_orphaned = user.plex_username not in plex_usernames
                 if is_orphaned:
-                    orphaned_count += 1
                     status_emoji = "⚠️"
 
                 user_info = f"**Plex:** `{user.plex_username}`"
@@ -715,8 +727,20 @@ class UserMgmtCog(commands.Cog):
                     inline=False
                 )
 
+            # Footer must state what actually happens. The inactivity check does NOT
+            # delete orphans - it logs "skipping (may be new)" and continues - so
+            # claiming auto-removal left them to accumulate while the admin was
+            # told they were handled.
+            notes = []
+            if len(tracked_users) > len(shown):
+                notes.append(f"Showing first {len(shown)} of {len(tracked_users)}")
             if orphaned_count > 0:
-                embed.set_footer(text=f"⚠️ {orphaned_count} orphaned entries (will be auto-removed on next check)")
+                notes.append(
+                    f"⚠️ {orphaned_count} not on Plex - remove with /removeuser "
+                    f"(not cleaned up automatically)"
+                )
+            if notes:
+                embed.set_footer(text=" · ".join(notes))
 
             await interaction.followup.send(embed=embed, ephemeral=True)
 
@@ -771,7 +795,9 @@ class UserMgmtCog(commands.Cog):
             if invalid_users:
                 embed.add_field(
                     name="❌ Invalid Users (Should be removed)",
-                    value="\n\n".join(invalid_users[:10]),  # Max 10 to fit in embed
+                    # The "max 10 fits" assumption was wrong: entries describing
+                    # over-long usernames can exceed the 1024-char field limit.
+                    value=truncate_field("\n\n".join(invalid_users[:10])),
                     inline=False
                 )
 
@@ -782,7 +808,7 @@ class UserMgmtCog(commands.Cog):
                     chunk = valid_users[i:i+5]
                     embed.add_field(
                         name=f"✅ Valid Users ({i+1}-{i+len(chunk)})",
-                        value="\n\n".join(chunk),
+                        value=truncate_field("\n\n".join(chunk)),
                         inline=False
                     )
 
@@ -860,7 +886,10 @@ class UserMgmtCog(commands.Cog):
 
             embed.add_field(
                 name=f"Users to Remove ({len(invalid_users)} total)",
-                value="\n\n".join(user_list),
+                # Clamped: an over-long value is rejected with HTTPException 400,
+                # which made this command fail whenever it had findings - and the
+                # long-username case is exactly what it looks for.
+                value=truncate_field("\n\n".join(user_list)),
                 inline=False
             )
 
@@ -983,7 +1012,7 @@ class UserMgmtCog(commands.Cog):
             return []
 
 
-class UserLinkControlPanel(discord.ui.View):
+class UserLinkControlPanel(AdminOnlyView):
     """Main control panel for user link management"""
 
     def __init__(self, bot: commands.Bot, services: BotServices):
@@ -1118,7 +1147,7 @@ class UserLinkControlPanel(discord.ui.View):
             await interaction.followup.send(f"❌ Error: {str(e)}", ephemeral=True)
 
 
-class LinkUserView(discord.ui.View):
+class LinkUserView(AdminOnlyView):
     """View for linking a Discord user to Plex account"""
 
     def __init__(self, bot: commands.Bot, services: BotServices, discord_users: list, plex_users: list):
@@ -1272,7 +1301,7 @@ class LinkUserView(discord.ui.View):
             logger.debug(f"Could not update view on cancel: {e}")
 
 
-class UnlinkUserView(discord.ui.View):
+class UnlinkUserView(AdminOnlyView):
     """View for unlinking a user"""
 
     def __init__(self, bot: commands.Bot, services: BotServices, linked_users: list):

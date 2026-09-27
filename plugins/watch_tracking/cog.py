@@ -11,6 +11,7 @@ from discord.ext import commands, tasks
 
 from core.blocking import run_blocking
 from utils.formatting import episode_label
+from utils.embeds import truncate_field
 from core.logging import get_logger
 from core.services import BotServices
 from database.session import get_session
@@ -412,7 +413,7 @@ class WatchTrackingCog(commands.Cog):
 
             embed.add_field(
                 name="👑 All-Time Champions",
-                value="\n".join(all_time_text) or "No data yet",
+                value=truncate_field("\n".join(all_time_text) or "No data yet"),
                 inline=False
             )
 
@@ -542,7 +543,7 @@ class WatchTrackingCog(commands.Cog):
         if current_text:
             embed.add_field(
                 name="Current Streaks",
-                value="\n".join(current_text),
+                value=truncate_field("\n".join(current_text)),
                 inline=False
             )
 
@@ -562,7 +563,7 @@ class WatchTrackingCog(commands.Cog):
         if longest_text:
             embed.add_field(
                 name="Longest Streaks (All-Time)",
-                value="\n".join(longest_text),
+                value=truncate_field("\n".join(longest_text)),
                 inline=False
             )
 

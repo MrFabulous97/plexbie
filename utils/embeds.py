@@ -79,6 +79,37 @@ def create_media_embed(media_item: dict) -> Embed:
     return embed
 
 
+#: Discord's hard limits. Exceeding either is rejected with HTTPException 400.
+MAX_FIELD_VALUE = 1024
+MAX_EMBED_TOTAL = 6000
+
+
+def truncate_field(text: str, limit: int = MAX_FIELD_VALUE, suffix: str = "\n… truncated") -> str:
+    """Clamp an embed field value to Discord's limit, keeping whole lines.
+
+    Discord rejects a field value over 1024 characters with HTTPException 400,
+    which callers surface as a generic error - so an over-long list makes a command
+    look broken exactly when it has the most to report. /cleanup-plex-users hit
+    this: ten entries describing over-long usernames came to roughly 2068
+    characters.
+    """
+    if text is None:
+        return ""
+    if len(text) <= limit:
+        return text
+
+    room = limit - len(suffix)
+    if room <= 0:
+        return text[:limit]
+
+    clipped = text[:room]
+    # Prefer cutting at a line boundary so an entry is not left half-rendered.
+    newline = clipped.rfind("\n")
+    if newline > room // 2:
+        clipped = clipped[:newline]
+    return clipped + suffix
+
+
 class PaginationView(discord.ui.View):
     """Pagination view for embeds.
 

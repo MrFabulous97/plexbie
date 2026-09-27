@@ -12,6 +12,7 @@ from sqlalchemy import select, update
 
 from core.blocking import run_blocking
 from utils.formatting import episode_label
+from utils.embeds import truncate_field
 from core.logging import get_logger
 from core.services import BotServices
 from database.session import get_session
@@ -545,7 +546,7 @@ class WatchPartyCog(commands.Cog):
         )
         embed.add_field(
             name=f"Participants ({len(participant_names)})",
-            value=", ".join(participant_names) if participant_names else "None",
+            value=truncate_field(", ".join(participant_names) if participant_names else "None"),
             inline=False
         )
 

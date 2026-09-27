@@ -14,7 +14,7 @@ from core.blocking import run_blocking
 from core.logging import get_logger
 from core.permissions import AdminOnlyView, require_admin
 from core.services import BotServices
-from utils.embeds import create_info_embed, create_error_embed
+from utils.embeds import create_info_embed, create_error_embed, truncate_field
 from database.kv_store import kv_get, kv_set
 
 logger = get_logger(__name__)
@@ -79,7 +79,7 @@ class CleanupControlPanel(AdminOnlyView):
             if self.cog.config["exclude_libraries"]:
                 embed.add_field(
                     name="Excluded Libraries",
-                    value="\n".join(f"• {lib}" for lib in self.cog.config["exclude_libraries"]),
+                    value=truncate_field("\n".join(f"• {lib}" for lib in self.cog.config["exclude_libraries"])),
                     inline=False
                 )
 
@@ -1265,7 +1265,7 @@ class MediaCleanupCog(commands.Cog):
             f"- {self._format_media_label(item.get('type', 'show'), item.get('title', 'Unknown'), item.get('year'))}"
             for item in entries[:20]
         ]
-        embed.add_field(name="Exempt Media", value="\n".join(lines), inline=False)
+        embed.add_field(name="Exempt Media", value=truncate_field("\n".join(lines)), inline=False)
         if len(entries) > 20:
             embed.set_footer(text=f"Showing first 20 of {len(entries)} exempt items")
 

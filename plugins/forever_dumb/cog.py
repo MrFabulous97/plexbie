@@ -7,6 +7,7 @@ from pathlib import Path
 import discord
 from discord.ext import commands
 
+from utils.embeds import truncate_field
 from core.logging import get_logger
 from core.services import BotServices
 
@@ -460,7 +461,7 @@ class ForeverDumbCog(commands.Cog):
                 # Add field with all members
                 embed.add_field(
                     name=f"Family Members ({len(family)})",
-                    value="\n".join(family_members) if family_members else "No members yet",
+                    value=truncate_field("\n".join(family_members) if family_members else "No members yet"),
                     inline=False
                 )
 

@@ -195,6 +195,12 @@ class SmartDumbRoleView(discord.ui.View):
                             logger.info(f"{member} is server owner, cannot update nickname counter")
                     except discord.Forbidden:
                         logger.warning(f"Could not update nickname for {member} (insufficient permissions)")
+                    except discord.HTTPException as e:
+                        # Must come after Forbidden, which subclasses it. Without
+                        # this a rejected nickname escapes every handler and the
+                        # user sees only "This interaction failed" - despite the
+                        # role change having already been applied.
+                        logger.warning(f"Could not update nickname for {member}: {e}")
 
                 # Send mocking message
                 mocking_messages = [

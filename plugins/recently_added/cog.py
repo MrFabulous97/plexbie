@@ -10,7 +10,7 @@ from core.blocking import run_blocking
 from utils.formatting import episode_label
 from core.logging import get_logger
 from core.services import BotServices
-from utils.embeds import create_media_embed, create_error_embed, PaginationView
+from utils.embeds import create_media_embed, create_error_embed, PaginationView, truncate_field
 
 logger = get_logger(__name__)
 
@@ -137,7 +137,7 @@ class RecentlyAddedCog(commands.Cog):
 
                     embed.add_field(
                         name=title[:256],  # Discord field name limit
-                        value="\n".join(value_parts),
+                        value=truncate_field("\n".join(value_parts)),
                         inline=False
                     )
 

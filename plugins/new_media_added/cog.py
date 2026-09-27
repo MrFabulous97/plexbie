@@ -10,6 +10,7 @@ import discord
 from discord.ext import commands, tasks
 
 from utils.formatting import episode_label, season_episode
+from utils.embeds import truncate_field
 from core.logging import get_logger
 from core.services import BotServices
 from database.kv_store import kv_get, kv_set, kv_get_all
@@ -248,7 +249,7 @@ class NewMediaAddedCog(commands.Cog):
             links.append(f"[View Details on Plex Web]({plex_web_url})")
 
         if links:
-            embed.add_field(name="Links", value="\n".join(links), inline=False)
+            embed.add_field(name="Links", value=truncate_field("\n".join(links)), inline=False)
 
         return embed
 

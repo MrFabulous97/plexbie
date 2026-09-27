@@ -7,7 +7,7 @@ from discord.ext import commands
 from core.blocking import run_blocking
 from core.logging import get_logger
 from core.services import BotServices
-from utils.embeds import create_info_embed, create_error_embed
+from utils.embeds import create_info_embed, create_error_embed, truncate_field
 
 logger = get_logger(__name__)
 
@@ -106,7 +106,7 @@ class StatusCog(commands.Cog):
                 
                 embed.add_field(
                     name="Currently Watching",
-                    value="\n".join(session_list),
+                    value=truncate_field("\n".join(session_list)),
                     inline=False
                 )
             
