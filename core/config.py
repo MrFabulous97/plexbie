@@ -121,6 +121,17 @@ class Config(BaseModel):
 
     # Webhook server (for inbound events)
     webhook_port: int = Field(default_factory=lambda: _env_int_default("WEBHOOK_PORT", 8080))
+    # Addresses to bind the webhook server to, comma-separated.
+    #
+    # Defaults to loopback only. The server previously bound 0.0.0.0, which with
+    # network_mode: host exposed every /webhook/* route to the whole LAN - and the
+    # routes accept unauthenticated requests whenever a secret is unset.
+    #
+    # Senders on the host network (Plex) reach the bot on 127.0.0.1. A sender in a
+    # bridge-networked container (Sonarr, Radarr, Tautulli, Overseerr) cannot, and
+    # needs the bridge gateway added here (e.g. "127.0.0.1,172.17.0.1") plus its
+    # notification URL pointed at that address.
+    webhook_bind: str = Field(default_factory=lambda: os.getenv("WEBHOOK_BIND", "127.0.0.1"))
     webhook_path: str = Field(default_factory=lambda: os.getenv("WEBHOOK_PATH", "/webhook"))
     sonarr_webhook_secret: Optional[str] = Field(default_factory=lambda: os.getenv("SONARR_WEBHOOK_SECRET"))
     radarr_webhook_secret: Optional[str] = Field(default_factory=lambda: os.getenv("RADARR_WEBHOOK_SECRET"))

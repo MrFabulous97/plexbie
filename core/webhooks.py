@@ -20,6 +20,7 @@ class WebhookServer:
         self.app = web.Application()
         self.runner = None
         self.validator = WebhookValidator(services.config)
+        self.bound_addresses = []
         # Services whose routes actually run through add_validated_post, so the
         # startup banner can report what is really protected.
         self._registered_services = set()
@@ -46,17 +47,49 @@ class WebhookServer:
         self.add_validated_post("/webhook/bazarr", self._handle_bazarr, "bazarr")
         self.app.router.add_get("/health", self._handle_health)
 
+    def _bind_addresses(self):
+        """Parse WEBHOOK_BIND into an ordered list of addresses."""
+        raw = getattr(self.services.config, "webhook_bind", "127.0.0.1") or "127.0.0.1"
+        addresses = [a.strip() for a in raw.split(",") if a.strip()]
+        return addresses or ["127.0.0.1"]
+
     async def start(self):
-        """Start the webhook server"""
+        """Start the webhook server.
+
+        Binds only the configured addresses (loopback by default) rather than
+        0.0.0.0. With network_mode: host, 0.0.0.0 published every /webhook/* route
+        to the entire LAN, and those routes pass unauthenticated requests through
+        whenever the matching secret is unset.
+        """
         port = self.services.config.webhook_port
+        addresses = self._bind_addresses()
 
         self.runner = web.AppRunner(self.app)
         await self.runner.setup()
 
-        site = web.TCPSite(self.runner, "0.0.0.0", port)
-        await site.start()
+        bound = []
+        for address in addresses:
+            try:
+                await web.TCPSite(self.runner, address, port).start()
+                bound.append(address)
+            except OSError as e:
+                logger.error(f"Could not bind webhook server to {address}:{port} - {e}")
 
-        logger.info(f"Webhook server listening on port {port}")
+        if not bound:
+            raise RuntimeError(
+                f"Webhook server could not bind any of {addresses} on port {port}"
+            )
+
+        self.bound_addresses = bound
+        listening = ", ".join(f"{a}:{port}" for a in bound)
+        logger.info(f"Webhook server listening on {listening}")
+
+        if any(a in ("0.0.0.0", "::") for a in bound):
+            logger.warning(
+                "   ⚠️  Webhook server is bound to all interfaces - every /webhook/* "
+                "route is reachable from the whole network. Set WEBHOOK_BIND to "
+                "restrict it (default 127.0.0.1)."
+            )
 
         self._log_auth_status()
 
