@@ -409,7 +409,7 @@ class SelfRolesCog(commands.Cog):
                 if self.nerd_message_id:
                     # Try to fetch and edit existing message
                     try:
-                        existing_message = await channel.fetch_message(self.nerd_message_id)
+                        existing_message = channel.get_partial_message(self.nerd_message_id)
                         await existing_message.edit(content=None, embed=embed, view=view)
                         self.button_attached = True
                         logger.info(f"✅ Updated existing Smart/Dumb role message {self.nerd_message_id} in {channel.name}")

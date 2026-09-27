@@ -322,7 +322,7 @@ class ForeverDumbCog(commands.Cog):
                 if self.forever_dumb_message_id:
                     # Try to fetch and edit existing message
                     try:
-                        existing_message = await channel.fetch_message(self.forever_dumb_message_id)
+                        existing_message = channel.get_partial_message(self.forever_dumb_message_id)
                         await existing_message.edit(content=None, embed=embed, view=view)
                         self.button_attached = True
                         logger.info(f"✅ Updated existing Forever Dumb message {self.forever_dumb_message_id} in {channel.name}")
@@ -472,7 +472,7 @@ class ForeverDumbCog(commands.Cog):
             # Update or create message
             if self.dumb_family_message_id:
                 try:
-                    message = await channel.fetch_message(self.dumb_family_message_id)
+                    message = channel.get_partial_message(self.dumb_family_message_id)
                     await message.edit(embed=embed)
                     logger.info(f"Updated Dumb Family message {self.dumb_family_message_id}")
                 except discord.NotFound:

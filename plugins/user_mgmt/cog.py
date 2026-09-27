@@ -178,6 +178,19 @@ class UserMgmtCog(commands.Cog):
             if not invites:
                 return
 
+            # Only contact Tautulli if something is actually waiting to be linked.
+            # Invite records are never removed once they link, so the steady state is
+            # a namespace where every entry is already 'linked' - and this loop was
+            # fetching the entire Tautulli user table every 5 minutes (288 times a
+            # day) only to skip every row it got back.
+            pending = {
+                discord_id_str: invite_data
+                for discord_id_str, invite_data in invites.items()
+                if invite_data.get('status') != 'linked' and invite_data.get('email')
+            }
+            if not pending:
+                return
+
             # Get current Tautulli users with emails
             url = f"{self.services.config.tautulli_url}/api/v2"
             params = {
@@ -197,15 +210,11 @@ class UserMgmtCog(commands.Cog):
                 if user.get('email'):
                     email_to_tautulli[user['email'].lower()] = user
 
-            # Check each pending invite
+            # Check each pending invite. The 'linked' and missing-email cases are
+            # already excluded by the `pending` filter above.
             linked_count = 0
-            for discord_id_str, invite_data in list(invites.items()):
-                if invite_data.get('status') == 'linked':
-                    continue  # Already linked
-
-                invite_email = invite_data.get('email', '').lower()
-                if not invite_email:
-                    continue
+            for discord_id_str, invite_data in list(pending.items()):
+                invite_email = invite_data['email'].lower()
 
                 # Check if this email exists in Tautulli
                 if invite_email in email_to_tautulli:

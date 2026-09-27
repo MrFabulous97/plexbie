@@ -523,8 +523,8 @@ class MediaCleanupCog(commands.Cog):
             logger.info(f"Request monitor cleanup summary: {monitor_summary}")
 
             # The whole traversal runs in one worker thread. It is one request to
-            # list sections, one per section to list items, and for every show two
-            # more per season - thousands of blocking round-trips on a real
+            # list sections, one per section to list items, and one more per show
+            # to list its episodes - hundreds of blocking round-trips on a real
             # library. Inline, that froze the event loop (and the Discord
             # heartbeat) for minutes and triggered gateway reconnects.
             items_to_notify, items_to_delete = await run_blocking(
@@ -668,8 +668,8 @@ class MediaCleanupCog(commands.Cog):
     def check_item_for_cleanup(self, item) -> Optional[Dict]:
         """Check if an item should be cleaned up.
 
-        Synchronous on purpose: it performs blocking plexapi calls (item.seasons()
-        and season.episodes() per show) and awaits nothing. Callers must invoke it
+        Synchronous on purpose: it performs a blocking plexapi call per show
+        (item.episodes()) and awaits nothing. Callers must invoke it
         from inside a worker thread - see _scan_libraries_for_cleanup.
         """
         try:
@@ -686,13 +686,13 @@ class MediaCleanupCog(commands.Cog):
 
             # For TV shows, check all episodes
             if item.type == "show":
-                # Get all episodes
-                episodes = []
-                for season in item.seasons():
-                    episodes.extend(season.episodes())
-
-                # Find the most recent view
-                for episode in episodes:
+                # One request per show, not one per season. Show.episodes() fetches
+                # /library/metadata/<key>/allLeaves in a single call; seasons()
+                # followed by episodes() on each season cost 1 + N requests. Across
+                # a few hundred shows that is the difference between a couple of
+                # hundred round-trips and a couple of thousand, and this runs inside
+                # the daily library walk.
+                for episode in item.episodes():
                     if episode.lastViewedAt:
                         if not last_viewed or episode.lastViewedAt > last_viewed:
                             last_viewed = episode.lastViewedAt

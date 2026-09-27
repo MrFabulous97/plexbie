@@ -79,6 +79,10 @@ class WatchTrackingCog(commands.Cog):
         self._username_cache: Dict[str, str] = {}
         self._cache_last_updated: Optional[datetime] = None
 
+        # Alias file contents, invalidated by (mtime, size) - see _load_aliases.
+        self._aliases_cache: Dict[str, str] = {}
+        self._aliases_stamp = None
+
         # Ensure files exist
         STREAKS_FILE.parent.mkdir(exist_ok=True)
         if not STREAKS_FILE.exists():
@@ -195,14 +199,39 @@ class WatchTrackingCog(commands.Cog):
         return self._username_cache.get(primary_username, primary_username)
 
     def _load_aliases(self) -> Dict[str, str]:
-        """Load user aliases from config file"""
+        """User aliases, cached and re-read only when the file actually changes.
+
+        This is called once per streaming user on every tick of the 10-second
+        update_now_watching loop (via _get_display_name -> _resolve_alias), and it
+        is a synchronous read on the event loop. Unconditionally opening, reading
+        and JSON-parsing the file there came to tens of thousands of blocking reads
+        a day to produce the same handful of mappings.
+
+        Keyed on (mtime, size) rather than a timer so that editing the file still
+        takes effect without a restart. The steady-state cost is one stat().
+        """
         try:
-            if USER_ALIASES_FILE.exists():
-                data = json.loads(USER_ALIASES_FILE.read_text())
-                return data.get('aliases', {})
+            stat = USER_ALIASES_FILE.stat()
+        except OSError:
+            # Missing or unreadable: no aliases, and nothing to invalidate against.
+            self._aliases_stamp = None
+            self._aliases_cache = {}
+            return self._aliases_cache
+
+        stamp = (stat.st_mtime_ns, stat.st_size)
+        if stamp == self._aliases_stamp:
+            return self._aliases_cache
+
+        try:
+            data = json.loads(USER_ALIASES_FILE.read_text())
+            self._aliases_cache = data.get('aliases', {}) or {}
+            self._aliases_stamp = stamp
         except Exception as e:
             logger.error(f"Error loading user aliases: {e}")
-        return {}
+            # Keep whatever was last parsed successfully, but do not record the
+            # stamp - a corrupt file should be retried, not cached as empty.
+            self._aliases_stamp = None
+        return self._aliases_cache
 
     def _resolve_alias(self, username: str) -> str:
         """Resolve a username to its primary name using aliases"""
@@ -307,7 +336,11 @@ class WatchTrackingCog(commands.Cog):
             # Update existing message only (never create new ones)
             if self.now_watching_message_id:
                 try:
-                    message = await self.stats_channel.fetch_message(self.now_watching_message_id)
+                    # A partial message edits without fetching first. The fetched body
+                    # was never read, so each update cost two REST calls instead of
+                    # one: the GET and PATCH counts on this route were identical in a
+                    # live sample (98/98), and this loop runs every 10 seconds.
+                    message = self.stats_channel.get_partial_message(self.now_watching_message_id)
 
                     # Calculate timestamp with latency compensation
                     # Add extra seconds to account for network/API/rendering delays
@@ -426,7 +459,8 @@ class WatchTrackingCog(commands.Cog):
                     # Update description with timestamp
                     embed.description = f"Compete for the crown of ultimate couch potato!\n\n*Next update <t:{next_update}:R>*"
 
-                    message = await self.stats_channel.fetch_message(self.leaderboard_message_id)
+                    # Partial message: edits without the wasted GET (see update_now_watching).
+                    message = self.stats_channel.get_partial_message(self.leaderboard_message_id)
                     await message.edit(embed=embed)
                 except Exception as e:
                     logger.error(f"Could not edit Leaderboard message {self.leaderboard_message_id}: {e}")
@@ -576,7 +610,8 @@ class WatchTrackingCog(commands.Cog):
                 # Update description with timestamp
                 embed.description = f"Keep your streak alive by watching something every day!\n\n*Next update <t:{next_update}:R>*"
 
-                message = await self.stats_channel.fetch_message(self.streaks_message_id)
+                # Partial message: edits without the wasted GET (see update_now_watching).
+                message = self.stats_channel.get_partial_message(self.streaks_message_id)
                 await message.edit(embed=embed)
             except Exception as e:
                 logger.error(f"Could not edit Streaks message {self.streaks_message_id}: {e}")

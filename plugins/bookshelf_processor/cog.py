@@ -1052,6 +1052,11 @@ def _remove_source(source_path: Path) -> None:
 
 HINT_MAX_AGE_DAYS = 14
 
+#: How often the scan loop sweeps expired hint files. The expiry itself is
+#: HINT_MAX_AGE_DAYS, so sweeping on every 10-second tick meant ~17,000 directory
+#: scans a day to enforce a fortnightly deadline.
+HINT_SWEEP_INTERVAL_SECONDS = 3600
+
 
 def _normalise_for_match(value: str) -> str:
     """Lowercase and strip everything but letters and digits.
@@ -1465,6 +1470,9 @@ class BookshelfProcessorCog(commands.Cog):
         self.ebook_lib = Path(os.environ.get("BOOKSHELF_EBOOK_LIBRARY", "/library/ebooks"))
         self.settle_seconds = int(os.environ.get("BOOKSHELF_SETTLE_SECONDS", "120"))
 
+        # When hint files were last swept - see HINT_SWEEP_INTERVAL_SECONDS.
+        self._last_hint_sweep = None
+
         # Cache directory for cover art
         self.cache_dir = Path(os.environ.get("BOOKSHELF_CACHE_DIR", "/app/cache/bookshelf"))
 
@@ -1538,6 +1546,14 @@ class BookshelfProcessorCog(commands.Cog):
         now = datetime.now()
         seen_paths = set()
 
+        # Decided once per tick so both watch directories sweep together.
+        sweep_hints = (
+            self._last_hint_sweep is None
+            or (now - self._last_hint_sweep).total_seconds() >= HINT_SWEEP_INTERVAL_SECONDS
+        )
+        if sweep_hints:
+            self._last_hint_sweep = now
+
         for watch_dir, media_type in [
             (self.audiobook_watch, "audiobook"),
             (self.ebook_watch, "ebook"),
@@ -1548,7 +1564,10 @@ class BookshelfProcessorCog(commands.Cog):
             # Expire stale hints here rather than only when an item happens to be
             # processed in this directory - orphaned hints outlive the download
             # they were written for, and a watch dir can sit empty for months.
-            await run_blocking(_expire_stale_hints, watch_dir)
+            # Throttled: the hints expire after HINT_MAX_AGE_DAYS, so there is no
+            # reason to go looking for them on every 10-second tick.
+            if sweep_hints:
+                await run_blocking(_expire_stale_hints, watch_dir)
 
             for path in await run_blocking(lambda d=watch_dir: list(d.iterdir())):
                 if path.name.startswith("."):

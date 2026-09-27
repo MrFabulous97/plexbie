@@ -493,6 +493,9 @@ class NewMediaAddedCog(commands.Cog):
             return
 
         try:
+        # Must be a real fetch, not get_partial_message: the existing embed fields
+        # are read below to merge in the new episodes, and a PartialMessage has no
+        # .embeds. The NotFound fallback that follows depends on the fetch too.
             message = await channel.fetch_message(batch.message_id)
         except discord.NotFound:
             logger.warning(f"Message {batch.message_id} not found, will create new one")
