@@ -1631,6 +1631,19 @@ class MediaRequestsCog(commands.Cog):
         if not REQUESTS_FILE.exists():
             REQUESTS_FILE.write_text("{}")
 
+    async def cog_load(self):
+        """Register the persistent approval views.
+
+        Must be here, not in setup(): core.plugin_manager instantiates the cog
+        class and calls bot.add_cog directly, so a module-level setup() is never
+        invoked by this bot. These two views had been registered only in setup(),
+        which means approve/decline on a pending request stopped working after
+        every restart despite the buttons carrying custom_ids.
+        """
+        self.bot.add_view(AdminApprovalView())
+        self.bot.add_view(BookAdminApprovalView())
+        logger.info("✅ Registered persistent media/book approval views")
+
     @app_commands.command(name="request", description="Request media (TV, Movie, Audiobook, or Ebook)")
     async def request_media(self, interaction: discord.Interaction):
         """Start media request flow — choose media type first"""
@@ -1718,7 +1731,5 @@ class MediaRequestsCog(commands.Cog):
 
 async def setup(bot: commands.Bot):
     """Setup function for loading cog"""
-    # Register persistent views so approve/decline buttons work after restart
-    bot.add_view(AdminApprovalView())
-    bot.add_view(BookAdminApprovalView())
+    # The views are registered in MediaRequestsCog.cog_load, which add_cog triggers.
     await bot.add_cog(MediaRequestsCog(bot, bot.services))

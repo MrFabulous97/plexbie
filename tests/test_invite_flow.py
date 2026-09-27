@@ -87,10 +87,9 @@ def test_discord_accepts_it_as_persistent():
     )
 
 
-def test_setup_registers_the_view():
-    import plugins.user_invites.cog as module
-
-    source = inspect.getsource(module.setup)
+def test_cog_load_registers_the_view():
+    """cog_load, not setup(): the plugin loader never calls setup()."""
+    source = _source(UserInvitesCog.cog_load)
     assert "add_view(PlexInviteApprovalView())" in source, (
         "without this, pending approval messages stop working after a restart"
     )
@@ -240,3 +239,61 @@ def test_no_nickname_is_built_by_string_concatenation():
             if re.search(r'new_nickname\s*=\s*f"', line):
                 offenders.append(f"{name}/cog.py:{number}")
     assert offenders == [], offenders
+
+
+# --- persistent views must register from a hook the loader actually calls ---
+
+def test_plugin_loader_never_calls_setup():
+    """The premise of the test below, asserted rather than assumed.
+
+    core.plugin_manager imports the module with fromlist=["setup"] but then
+    instantiates the cog class and calls add_cog itself - it never invokes
+    setup(). Anything placed there is dead code in this bot.
+    """
+    from core.plugin_manager import PluginManager
+
+    source = _source(PluginManager.load_plugin).replace('fromlist=["setup"]', "")
+    assert "setup(" not in source
+    assert "cog_class(self.bot" in source
+
+
+def test_no_persistent_view_is_registered_only_in_setup():
+    """Registering in setup() means the buttons silently die on every restart.
+
+    This is how PlexInviteApprovalView, AdminApprovalView and
+    BookAdminApprovalView all ended up unregistered.
+    """
+    import pathlib
+
+    root = pathlib.Path(conftest.PROJECT_ROOT)
+    offenders = []
+    for path in sorted(root.glob("plugins/*/cog.py")):
+        in_setup = False
+        for number, line in enumerate(path.read_text().splitlines(), 1):
+            if line.startswith("async def setup"):
+                in_setup = True
+            elif line and not line[0].isspace() and not line.startswith("async def setup"):
+                in_setup = False
+            if in_setup and "add_view(" in line and not line.strip().startswith("#"):
+                offenders.append(f"{path.relative_to(root)}:{number}")
+    assert offenders == [], (
+        "move these to cog_load or __init__, which add_cog actually triggers: "
+        + str(offenders)
+    )
+
+
+def test_every_persistent_view_is_registered_somewhere_reachable():
+    """Each timeout=None view must be registered from __init__ or cog_load."""
+    import pathlib
+    import re
+
+    root = pathlib.Path(conftest.PROJECT_ROOT)
+    missing = []
+    for path in sorted(root.glob("plugins/*/cog.py")):
+        text = path.read_text()
+        if "timeout=None" not in text:
+            continue
+        registered = re.findall(r"add_view\(", text)
+        if not registered:
+            missing.append(path.relative_to(root).as_posix())
+    assert missing == [], f"persistent views never registered in: {missing}"

@@ -270,6 +270,17 @@ class UserInvitesCog(commands.Cog):
         self.services = services
         # Discord ids with a /join-plex flow currently awaiting a DM reply.
         self._in_progress: set = set()
+
+    async def cog_load(self):
+        """Register the persistent approval view.
+
+        Must be here, not in setup(): core.plugin_manager instantiates the cog
+        class and calls bot.add_cog directly, so a module-level setup() is never
+        invoked by this bot. add_cog does trigger cog_load, and it also fires if
+        the plugin is ever loaded as a normal discord.py extension.
+        """
+        self.bot.add_view(PlexInviteApprovalView())
+        logger.info("✅ Registered persistent Plex invite approval view")
         
     
     @app_commands.command(name="join-plex", description="Request access to the Plex server")
@@ -428,8 +439,5 @@ class UserInvitesCog(commands.Cog):
 
 async def setup(bot: commands.Bot):
     """Setup function for loading cog"""
+    # The view is registered in UserInvitesCog.cog_load, which add_cog triggers.
     await bot.add_cog(UserInvitesCog(bot, bot.services))
-    # Register the persistent view so pending approval messages keep working after
-    # a restart. Requires every button to carry a custom_id, which they now do -
-    # add_view raises ValueError otherwise.
-    bot.add_view(PlexInviteApprovalView())
