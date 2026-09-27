@@ -23,6 +23,47 @@ logger = get_logger(__name__)
 REQUESTS_FILE = Path("config/media_requests.json")
 
 
+# Language names that may indicate a non-English release. Matched as whole
+# tokens only - two-letter codes like ".it." were removed because they collide
+# with ordinary English words ("Make.It.Stick").
+LANGUAGE_TAGS = frozenset({
+    "german", "deutsch", "french", "francais", "spanish", "espanol",
+    "italian", "italiano", "portuguese", "dutch", "nederlands", "swedish",
+    "norwegian", "danish", "finnish", "hungarian", "polish", "czech",
+    "russian", "chinese", "japanese", "korean", "arabic", "turkish",
+})
+
+
+def result_title(item) -> str:
+    """Read a newznab <item>'s title, tolerating a malformed entry.
+
+    ElementTree find() returns None when the child is absent, so the original
+    `item.find("title").text` raised AttributeError - which unwound the entire
+    submission and discarded every other result because one entry was malformed.
+    """
+    element = item.find("title")
+    if element is None or not element.text:
+        return ""
+    return element.text.strip()
+
+
+def looks_foreign_language(release_title: str) -> bool:
+    """Whether a release name carries a non-English language tag.
+
+    Whole-token matching, so "Make.It.Stick" is not flagged by a stray "it".
+
+    This is deliberately only a RANKING signal, never a filter. A language word
+    in a release name is ambiguous - "The.Dutch.House" and "Der.Schwarm.German"
+    are indistinguishable by title alone - and the previous code dropped any
+    match outright, so legitimate English books (The Dutch House, The German
+    Wife, Russian Roulette, even "Norwegian.Wood...English.EPUB") were discarded
+    and the requester was told no results existed. Penalising instead means a
+    false positive costs a place in the ordering, not the whole request.
+    """
+    tokens = set(re.split(r"[^a-z]+", release_title.lower()))
+    return bool(tokens & LANGUAGE_TAGS)
+
+
 class MediaTypeSelectView(discord.ui.View):
     """Initial view with buttons to choose between TV/Movie and Audiobook/Ebook"""
     def __init__(self, cog: 'MediaRequestsCog', user_id: int):
@@ -884,24 +925,22 @@ class BookAdminApprovalView(AdminOnlyView):
 
                 logger.info(f"NZBHydra returned {len(items)} results")
 
-                # 3. Filter and rank results
+                # 3. Rank results
                 ns = {'newznab': 'http://www.newznab.com/DTD/2010/feeds/attributes/'}
-                foreign_indicators = [
-                    'german', 'french', 'spanish', 'deutsch', 'francais',
-                    'italiano', 'portuguese', 'dutch', 'swedish', 'norwegian',
-                    '.de.', '.fr.', '.es.', '.it.', '.nl.', '.pt.',
-                    'hungarian', 'polish', 'czech', 'russian', 'chinese',
-                    'japanese', 'korean', 'arabic', 'turkish'
-                ]
 
                 candidates = []
                 for item in items:
-                    item_title = (item.find('title').text or '').strip()
+                    # A malformed result is skipped, not fatal - see result_title().
+                    item_title = result_title(item)
+                    if not item_title:
+                        logger.debug("Skipping NZBHydra result with no title")
+                        continue
                     title_lower = item_title.lower()
 
-                    # Skip foreign language results
-                    if any(ind in title_lower for ind in foreign_indicators):
-                        continue
+                    # Language is a ranking signal, never a filter - see
+                    # looks_foreign_language(). Dropping matches here discarded
+                    # legitimate English books whose titles contain a nationality.
+                    is_foreign = looks_foreign_language(item_title)
 
                     # Get grabs count
                     grabs = 0
@@ -928,21 +967,38 @@ class BookAdminApprovalView(AdminOnlyView):
                             'title': item_title,
                             'grabs': grabs,
                             'has_epub': has_epub,
+                            'is_foreign': is_foreign,
                             'nzb_url': nzb_url
                         })
 
                 if not candidates:
-                    logger.warning(f"No suitable English results for: {search_term}")
+                    logger.warning(f"No usable results for: {search_term}")
                     return False
 
-                # Sort: prefer EPUB (for ebooks), then by grabs (most downloaded first)
+                # Sort: English-looking first, then EPUB (for ebooks), then by
+                # grabs. reverse=True puts True before False, so the key uses
+                # "not is_foreign" to rank English-looking releases first.
                 if format_type != 'audiobook':
-                    candidates.sort(key=lambda x: (x['has_epub'], x['grabs']), reverse=True)
+                    candidates.sort(
+                        key=lambda x: (not x['is_foreign'], x['has_epub'], x['grabs']),
+                        reverse=True,
+                    )
                 else:
-                    candidates.sort(key=lambda x: x['grabs'], reverse=True)
+                    candidates.sort(
+                        key=lambda x: (not x['is_foreign'], x['grabs']),
+                        reverse=True,
+                    )
 
                 best = candidates[0]
-                logger.info(f"Selected: '{best['title']}' ({best['grabs']} grabs, epub={best['has_epub']})")
+                logger.info(
+                    f"Selected: '{best['title']}' ({best['grabs']} grabs, "
+                    f"epub={best['has_epub']}) from {len(candidates)} candidates"
+                )
+                if best['is_foreign']:
+                    logger.warning(
+                        f"Best candidate carries a language tag and may not be "
+                        f"English: '{best['title']}'"
+                    )
 
                 # 4. Send NZB to SABnzbd
                 sab_params = {

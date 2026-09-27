@@ -21,6 +21,7 @@ import aiohttp
 import discord
 from discord.ext import commands, tasks
 
+from core.blocking import run_blocking
 from core.logging import get_logger
 from core.admin_mirror import send_user_dm
 
@@ -962,6 +963,159 @@ def _similarity(a: str, b: str) -> float:
     return len(overlap) / max(len(words_a), len(words_b))
 
 
+def _item_signature(path: Path) -> tuple:
+    """A cheap fingerprint of an item: (file count, total bytes, newest mtime).
+
+    Blocking (it stats the tree), so call it via run_blocking. Used two ways:
+    to tell whether a download is still being written, and to tell whether a
+    previously-failed item has changed enough to be worth retrying.
+    """
+    try:
+        if not path.exists():
+            # Distinct from an empty directory (0, 0, 0): a vanished item must not
+            # compare equal to one that is merely empty, or the failed-item
+            # bookkeeping would treat a disappear-and-reappear as "unchanged".
+            return (-1, -1, -1)
+
+        if path.is_file():
+            stat = path.stat()
+            return (1, stat.st_size, int(stat.st_mtime))
+
+        count = 0
+        total = 0
+        newest = 0
+        for child in path.rglob("*"):
+            try:
+                if child.is_file():
+                    stat = child.stat()
+                    count += 1
+                    total += stat.st_size
+                    newest = max(newest, int(stat.st_mtime))
+            except OSError:
+                # Vanished mid-walk - the tree is changing, which is itself the
+                # answer we care about.
+                continue
+        return (count, total, newest)
+    except OSError as e:
+        logger.debug(f"Could not fingerprint {path}: {e}")
+        return (-1, -1, -1)
+
+
+def _move_book_files(book_files, dest: Path) -> list:
+    """Blocking: move every book file into `dest`. Returns names that failed.
+
+    Failures are collected, not raised, because the caller must know whether the
+    source tree is safe to delete. Deleting it after a partial move destroys the
+    only copy of whatever did not make it across.
+    """
+    failed = []
+    for source_file in book_files:
+        try:
+            shutil.move(str(source_file), str(dest / source_file.name))
+            logger.debug(f"Moved: {source_file.name}")
+        except Exception as e:
+            failed.append(source_file.name)
+            logger.error(f"Failed to move {source_file.name}: {e}")
+    return failed
+
+
+def _adopt_existing_cover(existing_covers, dest: Path) -> bool:
+    """Blocking: move the largest cover found in the source into `dest`."""
+    try:
+        best = max(existing_covers, key=lambda c: c.stat().st_size if c.exists() else 0)
+    except ValueError:
+        return False
+
+    if not best.exists():
+        return False
+    try:
+        shutil.move(str(best), str(dest / "cover.jpg"))
+        logger.info(f"Used existing cover: {best.name}")
+        return True
+    except Exception as e:
+        logger.debug(f"Could not use existing cover {best.name}: {e}")
+        return False
+
+
+def _remove_source(source_path: Path) -> None:
+    """Blocking: delete the source once everything has been moved out of it."""
+    try:
+        if source_path.is_dir():
+            shutil.rmtree(source_path)
+            logger.debug(f"Removed source directory: {source_path.name}")
+        elif source_path.is_file():
+            source_path.unlink()
+            logger.debug(f"Removed source file: {source_path.name}")
+    except Exception as e:
+        logger.warning(f"Could not remove source {source_path.name}: {e}")
+
+
+HINT_MAX_AGE_DAYS = 14
+
+
+def _normalise_for_match(value: str) -> str:
+    """Lowercase and strip everything but letters and digits.
+
+    SABnzbd sanitises the NZB title when it creates the folder, so the two are
+    rarely byte-identical - but they normalise to the same string.
+    """
+    return re.sub(r"[^a-z0-9]+", "", value.lower())
+
+
+def _find_hint_file(watch_dir: Path, item_name: str):
+    """Locate the hint file belonging to `item_name`, expiring stale ones.
+
+    Blocking (globs and reads files), so call via run_blocking.
+
+    The previous test was `nzb_title in item_name or item_name in nzb_title` - a
+    substring match in both directions - and hints were never cleaned up unless
+    successfully consumed. A download that never completed left its hint forever,
+    so an unrelated later book whose name merely overlapped inherited that hint's
+    author, title, series and cover. Because a hint short-circuits all metadata
+    extraction, nothing downstream would notice the mismatch.
+
+    Now: exact match on the normalised name, and anything older than
+    HINT_MAX_AGE_DAYS is deleted rather than left to mismatch.
+    """
+    target = _normalise_for_match(item_name)
+    if not target:
+        return None
+
+    now = datetime.now().timestamp()
+    cutoff = HINT_MAX_AGE_DAYS * 86400
+    matches = []
+
+    for candidate in watch_dir.glob(".plexbie_hint_*.json"):
+        try:
+            mtime = candidate.stat().st_mtime
+            age_days = (now - mtime) / 86400
+            if age_days > HINT_MAX_AGE_DAYS:
+                candidate.unlink()
+                logger.info(
+                    f"Removed stale hint file ({age_days:.0f} days old): {candidate.name}"
+                )
+                continue
+
+            with open(candidate) as handle:
+                payload = json.load(handle)
+        except Exception as e:
+            logger.debug(f"Ignoring unreadable hint {candidate.name}: {e}")
+            continue
+
+        nzb_title = payload.get("nzb_title") or ""
+        if nzb_title and _normalise_for_match(nzb_title) == target:
+            matches.append((mtime, candidate))
+
+    if not matches:
+        return None
+
+    # Newest wins, so the choice is deterministic rather than glob-order dependent.
+    matches.sort(key=lambda pair: pair[0], reverse=True)
+    if len(matches) > 1:
+        logger.warning(f"{len(matches)} hint files match {item_name}; using the newest")
+    return matches[0][1]
+
+
 # ─── Main Processing Pipeline ────────────────────────────────────────────────
 
 
@@ -984,7 +1138,7 @@ async def process_item(
       4. Folder name parsing (only if files contain no metadata)
     """
     if source_path.name.startswith("."):
-        return
+        return True  # hidden/control file - nothing to do, not a failure
 
     logger.info(f"{'=' * 60}")
     logger.info(f"Processing {media_type}: {source_path.name}")
@@ -1001,19 +1155,9 @@ async def process_item(
 
     # Check 2: .plexbie_hint_<name>.json in the watch directory (written by media_requests cog)
     if not hint_file:
-        watch_dir = source_path.parent
-        item_name = source_path.name
-        for f in watch_dir.glob(".plexbie_hint_*.json"):
-            try:
-                with open(f) as fh:
-                    h = json.load(fh)
-                # Match by NZB title — SABnzbd creates folder with this name
-                nzb_title = h.get("nzb_title", "")
-                if nzb_title and (nzb_title in item_name or item_name in nzb_title):
-                    hint_file = f
-                    break
-            except Exception:
-                continue
+        hint_file = await run_blocking(
+            _find_hint_file, source_path.parent, source_path.name
+        )
 
     if hint_file:
         try:
@@ -1040,13 +1184,14 @@ async def process_item(
         book_files = [source_path]
         existing_covers = []
     else:
-        clean_junk_files(source_path)
-        book_files = find_book_files(source_path, media_type)
-        existing_covers = find_existing_covers(source_path)
+        # Directory walks and unlinks - blocking, so off the loop.
+        await run_blocking(clean_junk_files, source_path)
+        book_files = await run_blocking(find_book_files, source_path, media_type)
+        existing_covers = await run_blocking(find_existing_covers, source_path)
 
     if not book_files:
         logger.warning(f"No valid {media_type} files found in {source_path.name}, skipping")
-        return
+        return False
 
     logger.info(f"Found {len(book_files)} {media_type} file(s)")
 
@@ -1054,7 +1199,8 @@ async def process_item(
 
     if not hint_used:
         # 2. READ THE FILES - extract embedded metadata (this is our primary source)
-        embedded = extract_metadata_from_files(book_files)
+        # Parses tags with mutagen and unzips EPUBs - reads every file.
+        embedded = await run_blocking(extract_metadata_from_files, book_files)
         isbn = None
 
         if embedded:
@@ -1141,19 +1287,17 @@ async def process_item(
             counter += 1
         logger.warning(f"Destination exists, using: {dest}")
 
-    dest.mkdir(parents=True, exist_ok=True)
+    await run_blocking(dest.mkdir, parents=True, exist_ok=True)
 
-    # 5. Move book files. Track failures: step 8 must not delete the source tree
-    # while any file is still only present there.
-    failed_moves = []
-    for f in book_files:
-        target = dest / f.name
-        try:
-            shutil.move(str(f), str(target))
-            logger.debug(f"Moved: {f.name}")
-        except Exception as e:
-            failed_moves.append(f.name)
-            logger.error(f"Failed to move {f.name}: {e}")
+    # 5. Move book files, off the event loop. An audiobook is routinely several GB
+    # across many files, and shutil.move falls back to a byte-for-byte copy
+    # whenever the rename cannot be done in place (which on an Unraid user share
+    # happens whenever source and destination land on different disks). Run inline
+    # this held the loop - and the Discord heartbeat - for the whole copy.
+    #
+    # Failures are returned rather than raised: step 8 must not delete the source
+    # tree while any file still exists only there.
+    failed_moves = await run_blocking(_move_book_files, book_files, dest)
 
     # 6. Handle cover art
     cover_done = False
@@ -1161,7 +1305,7 @@ async def process_item(
     # First, try embedded cover from the file itself (only if not using hint)
     if embedded_cover_data and not cover_done:
         try:
-            (dest / "cover.jpg").write_bytes(embedded_cover_data)
+            await run_blocking((dest / "cover.jpg").write_bytes, embedded_cover_data)
             cover_done = True
             logger.info(f"Used embedded cover art ({len(embedded_cover_data)} bytes)")
         except Exception as e:
@@ -1169,14 +1313,7 @@ async def process_item(
 
     # Second, check for existing cover in source directory
     if not cover_done and existing_covers:
-        best_cover = max(existing_covers, key=lambda c: c.stat().st_size if c.exists() else 0)
-        if best_cover.exists():
-            try:
-                shutil.move(str(best_cover), str(dest / "cover.jpg"))
-                cover_done = True
-                logger.info(f"Used existing cover: {best_cover.name}")
-            except Exception:
-                pass
+        cover_done = await run_blocking(_adopt_existing_cover, existing_covers, dest)
 
     # If no existing cover, download one (works for both hint and normal paths)
     if not cover_done and final.get("cover_url"):
@@ -1186,7 +1323,7 @@ async def process_item(
         logger.warning(f"No cover art available for {final['title']}")
 
     # 7. Generate metadata.opf
-    generate_opf(final, dest / "metadata.opf")
+    await run_blocking(generate_opf, final, dest / "metadata.opf")
 
     # 8. Clean up source - only when everything was successfully moved out of it.
     # Deleting the source after a partial move permanently destroys the files that
@@ -1196,17 +1333,8 @@ async def process_item(
             f"Keeping source {source_path} intact: {len(failed_moves)} file(s) failed "
             f"to move ({', '.join(failed_moves)}). Resolve manually then re-run."
         )
-    elif source_path.is_dir() and source_path.exists():
-        try:
-            shutil.rmtree(source_path)
-            logger.debug(f"Removed source directory: {source_path.name}")
-        except Exception as e:
-            logger.warning(f"Could not remove source directory: {e}")
-    elif source_path.is_file() and source_path.exists():
-        try:
-            source_path.unlink()
-        except Exception as e:
-            logger.warning(f"Could not remove source file {source_path.name}: {e}")
+    else:
+        await run_blocking(_remove_source, source_path)
 
     # 9. Clean up hint file if used
     if hint_used and hint_file.exists():
@@ -1291,6 +1419,7 @@ async def process_item(
         except Exception as e:
             logger.error(f"Error sending notifications: {e}", exc_info=True)
 
+    return True
 
 # ─── Discord Cog ─────────────────────────────────────────────────────────────
 
@@ -1313,8 +1442,16 @@ class BookshelfProcessorCog(commands.Cog):
         # Cache directory for cover art
         self.cache_dir = Path(os.environ.get("BOOKSHELF_CACHE_DIR", "/app/cache/bookshelf"))
 
-        # Pending items: {path_str: datetime_first_seen}
-        self.pending: dict[str, datetime] = {}
+        # Items waiting to settle: {path_str: (signature, datetime_last_changed)}
+        # The signature is refreshed every scan; the timer restarts whenever it
+        # changes, so an item is only processed once it has stopped being written.
+        self.pending: dict[str, tuple] = {}
+
+        # Items that could not be processed, keyed by the signature they had when
+        # they failed: {path_str: signature}. Skipped while unchanged, so a
+        # permanently broken item is attempted once rather than every scan
+        # forever, but genuinely gains a retry the moment its contents change.
+        self.failed: dict[str, tuple] = {}
 
     async def cog_load(self):
         """Called when the cog is loaded. Start the watcher loop."""
@@ -1328,8 +1465,11 @@ class BookshelfProcessorCog(commands.Cog):
         # Ensure cache directory exists
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 
-        # Process any existing items in watch directories on startup
-        await self._process_existing_items()
+        # Note anything already sitting in the watch dirs, but do NOT process it
+        # here - it goes through the same settle wait as anything new. Processing
+        # inline meant a restart mid-download (including every deploy) handled a
+        # partial download immediately, with no grace period at all.
+        await self._seed_existing_items()
 
         # Start the scan loop
         self.scan_loop.start()
@@ -1339,42 +1479,39 @@ class BookshelfProcessorCog(commands.Cog):
         self.scan_loop.cancel()
         logger.info("Bookshelf Processor stopped")
 
-    async def _process_existing_items(self):
-        """Process anything already sitting in watch dirs on startup."""
-        logger.info("Checking for existing items in watch directories...")
+    async def _seed_existing_items(self):
+        """Record anything already in the watch dirs so the scan loop settles it.
 
-        if self.audiobook_watch.exists():
-            for path in sorted(self.audiobook_watch.iterdir()):
-                if not path.name.startswith("."):
-                    try:
-                        await process_item(
-                            path, "audiobook",
-                            self.audiobook_lib, self.ebook_lib,
-                            cache_dir=self.cache_dir,
-                            bot=self.bot,
-                        )
-                    except Exception as e:
-                        logger.error(f"Failed to process existing audiobook {path.name}: {e}", exc_info=True)
+        Deliberately does not process anything: an item present at startup is
+        indistinguishable from one that arrived a second ago, and may well be a
+        download still in flight.
+        """
+        seeded = 0
+        now = datetime.now()
+        for watch_dir in (self.audiobook_watch, self.ebook_watch):
+            if not watch_dir.exists():
+                continue
+            for path in sorted(watch_dir.iterdir()):
+                if path.name.startswith("."):
+                    continue
+                signature = await run_blocking(_item_signature, path)
+                self.pending[str(path)] = (signature, now)
+                seeded += 1
 
-        if self.ebook_watch.exists():
-            for path in sorted(self.ebook_watch.iterdir()):
-                if not path.name.startswith("."):
-                    try:
-                        await process_item(
-                            path, "ebook",
-                            self.audiobook_lib, self.ebook_lib,
-                            cache_dir=self.cache_dir,
-                            bot=self.bot,
-                        )
-                    except Exception as e:
-                        logger.error(f"Failed to process existing ebook {path.name}: {e}", exc_info=True)
+        if seeded:
+            logger.info(
+                f"Found {seeded} existing item(s) in watch directories; they will "
+                f"be processed after the {self.settle_seconds}s settle period"
+            )
+        else:
+            logger.info("No existing items in watch directories")
 
     @tasks.loop(seconds=10)
     async def scan_loop(self):
-        """Scan watch directories every 10 seconds for new items."""
+        """Scan watch directories every 10 seconds for items ready to process."""
         now = datetime.now()
+        seen_paths = set()
 
-        # Scan for new items in watch directories
         for watch_dir, media_type in [
             (self.audiobook_watch, "audiobook"),
             (self.ebook_watch, "ebook"),
@@ -1382,32 +1519,57 @@ class BookshelfProcessorCog(commands.Cog):
             if not watch_dir.exists():
                 continue
 
-            for path in watch_dir.iterdir():
+            for path in await run_blocking(lambda d=watch_dir: list(d.iterdir())):
                 if path.name.startswith("."):
                     continue
 
                 path_str = str(path)
-                if path_str not in self.pending:
-                    self.pending[path_str] = now
+                seen_paths.add(path_str)
+                signature = await run_blocking(_item_signature, path)
+
+                # Skip a known-bad item until its contents actually change.
+                previous_failure = self.failed.get(path_str)
+                if previous_failure is not None:
+                    if previous_failure == signature:
+                        continue
+                    logger.info(
+                        f"{path.name} changed since it last failed - retrying"
+                    )
+                    del self.failed[path_str]
+
+                known = self.pending.get(path_str)
+                if known is None:
+                    self.pending[path_str] = (signature, now)
                     logger.info(f"New {media_type} detected: {path.name}")
+                elif known[0] != signature:
+                    # Still being written: restart the settle timer.
+                    self.pending[path_str] = (signature, now)
+                    logger.debug(f"{path.name} still changing, settle timer reset")
 
-        # Process settled items
-        settled = []
-        for path_str, first_seen in list(self.pending.items()):
-            if (now - first_seen).total_seconds() >= self.settle_seconds:
-                path = Path(path_str)
-                if path.exists():
-                    # Determine media type from which watch dir it's in
-                    if str(path).startswith(str(self.audiobook_watch)):
-                        media_type = "audiobook"
-                    else:
-                        media_type = "ebook"
-                    settled.append((path, media_type))
+        # Forget anything that has disappeared from the watch dirs.
+        for path_str in list(self.pending):
+            if path_str not in seen_paths:
                 del self.pending[path_str]
+        for path_str in list(self.failed):
+            if path_str not in seen_paths:
+                del self.failed[path_str]
 
-        for path, media_type in settled:
+        # Collect items whose signature has been stable for the settle period.
+        settled = []
+        for path_str, (signature, last_changed) in list(self.pending.items()):
+            if (now - last_changed).total_seconds() < self.settle_seconds:
+                continue
+            path = Path(path_str)
+            if str(path).startswith(str(self.audiobook_watch)):
+                media_type = "audiobook"
+            else:
+                media_type = "ebook"
+            settled.append((path, media_type, signature))
+            del self.pending[path_str]
+
+        for path, media_type, signature in settled:
             try:
-                await process_item(
+                processed = await process_item(
                     path, media_type,
                     self.audiobook_lib, self.ebook_lib,
                     cache_dir=self.cache_dir,
@@ -1415,6 +1577,18 @@ class BookshelfProcessorCog(commands.Cog):
                 )
             except Exception as e:
                 logger.error(f"Failed to process {media_type} {path.name}: {e}", exc_info=True)
+                processed = False
+
+            if not processed and path.exists():
+                # Record the failure against the signature we processed, so this
+                # item is not reprocessed (and re-logged) on every scan forever.
+                # One empty folder previously produced 30,931 processing cycles
+                # and 26 MB of log output.
+                self.failed[str(path)] = signature
+                logger.warning(
+                    f"Not retrying {path.name} until its contents change "
+                    f"(remove it from the watch directory to stop this notice)"
+                )
 
     @scan_loop.before_loop
     async def before_scan_loop(self):
