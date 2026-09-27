@@ -24,24 +24,43 @@ def redact(text: str) -> str:
     return result
 
 
+SENSITIVE_KEYS = {"token", "key", "secret", "password", "auth", "api_key", "apikey"}
+
+
+def _redact_value(value: Any) -> Any:
+    """Redact a value of any shape, recursing through containers.
+
+    Lists were previously returned untouched, so a payload like
+    ``{"users": [{"token": "abc"}]}`` - the shape every *arr and Overseerr webhook
+    uses - logged its secrets in full.
+    """
+    if isinstance(value, dict):
+        return redact_dict(value)
+    if isinstance(value, list):
+        return [_redact_value(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_redact_value(item) for item in value)
+    if isinstance(value, str):
+        return redact(value)
+    return value
+
+
 def redact_dict(data: Dict[str, Any]) -> Dict[str, Any]:
-    """Recursively redact sensitive data from dictionary"""
+    """Recursively redact sensitive data from a dictionary.
+
+    Keys whose name looks sensitive are replaced wholesale; everything else is
+    walked, including lists and tuples of nested dictionaries.
+    """
     if not isinstance(data, dict):
         return data
-    
+
     result = {}
-    sensitive_keys = {"token", "key", "secret", "password", "auth", "api_key", "apikey"}
-    
     for key, value in data.items():
-        if any(s in key.lower() for s in sensitive_keys):
+        if any(s in str(key).lower() for s in SENSITIVE_KEYS):
             result[key] = "REDACTED"
-        elif isinstance(value, dict):
-            result[key] = redact_dict(value)
-        elif isinstance(value, str):
-            result[key] = redact(value)
         else:
-            result[key] = value
-    
+            result[key] = _redact_value(value)
+
     return result
 
 
