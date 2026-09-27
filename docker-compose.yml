@@ -1,0 +1,27 @@
+# Plexbie Discord bot.
+#
+# The plexbie-web and nginx services were removed on 2026-09-27: the web UI was
+# no longer in use. Their source, config, TLS certs and a full image archive are
+# preserved under backups/plexbie-web-decommission-*/ if it is ever wanted back.
+#
+# The bot uses network_mode: host, so it never depended on the bridge network
+# those services shared, and all three of their mounts were read-only.
+services:
+  plexbie:
+    image: plexbie:latest
+    container_name: plexbie
+    restart: unless-stopped
+    network_mode: host
+    working_dir: /app
+    command: ["python", "-u", "bot.py"]
+    volumes:
+      - /mnt/user/appdata/plexbie/plexbie/plugins/media_cleanup:/app/plugins/media_cleanup
+      - /mnt/user/appdata/plexbie/plexbie/plugins/media_requests:/app/plugins/media_requests
+      - /mnt/user/appdata/plexbie/plexbie/plugins/new_media_added:/app/plugins/new_media_added
+      - /mnt/user/appdata/plexbie/plexbie/core/media_tracking.py:/app/core/media_tracking.py
+      - /mnt/user/data/usenet/complete/audiobooks:/watch/audiobooks
+      - /mnt/user/data/usenet/complete/ebooks:/watch/ebooks
+      - /mnt/user/data/media/audiobooks:/library/audiobooks
+      - /mnt/user/data/media/ebooks:/library/ebooks
+      - /mnt/user/appdata/plexbie/config:/app/config
+      - /mnt/user/appdata/plexbie/logs:/app/logs
