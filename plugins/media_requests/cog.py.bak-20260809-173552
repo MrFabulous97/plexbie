@@ -1,0 +1,1644 @@
+# path: plugins/media_requests/cog.py
+"""Media request system matching original JS bot workflow"""
+import asyncio
+import json
+import re
+from datetime import datetime
+from typing import Optional, List, Dict, Any
+from pathlib import Path
+
+import discord
+from discord import app_commands
+from discord.ext import commands
+
+from core.logging import get_logger
+from core.services import BotServices
+from utils.embeds import create_error_embed
+
+logger = get_logger(__name__)
+
+# Storage file for requests
+REQUESTS_FILE = Path("config/media_requests.json")
+
+
+class MediaTypeSelectView(discord.ui.View):
+    """Initial view with buttons to choose between TV/Movie and Audiobook/Ebook"""
+    def __init__(self, cog: 'MediaRequestsCog', user_id: int):
+        super().__init__(timeout=120)
+        self.cog = cog
+        self.user_id = user_id
+
+    @discord.ui.button(label="TV & Movie", style=discord.ButtonStyle.primary, emoji="🎬")
+    async def tv_movie(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("This isn't your request!", ephemeral=True)
+            return
+        modal = TVMovieRequestModal(cog=self.cog)
+        await interaction.response.send_modal(modal)
+
+    @discord.ui.button(label="Audiobook & Ebook", style=discord.ButtonStyle.primary, emoji="📚")
+    async def audiobook_ebook(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("This isn't your request!", ephemeral=True)
+            return
+        modal = BookRequestModal(cog=self.cog)
+        await interaction.response.send_modal(modal)
+
+
+class TVMovieRequestModal(discord.ui.Modal, title="Request TV Show or Movie"):
+    """Modal for collecting TV/Movie search query"""
+    search_query = discord.ui.TextInput(
+        label="What would you like to request?",
+        placeholder="Movie or TV show name",
+        style=discord.TextStyle.short,
+        required=True
+    )
+
+    def __init__(self, cog: 'MediaRequestsCog'):
+        super().__init__()
+        self.cog = cog
+
+    async def on_submit(self, interaction: discord.Interaction):
+        query = self.search_query.value.strip()
+        await interaction.response.send_message("🔍 Searching...", ephemeral=True)
+
+        try:
+            results = await self.cog._search_tmdb(query)
+
+            if not results:
+                await interaction.edit_original_response(
+                    content="No results found. Please try a different search term or use `/request` again."
+                )
+                return
+
+            view = MediaSelectView(results, interaction.user.id, self.cog.services)
+            await interaction.edit_original_response(
+                content="**I found these titles:**",
+                view=view
+            )
+        except Exception as e:
+            logger.error(f"Search error after modal submit: {e}")
+            await interaction.edit_original_response(
+                content="An error occurred. Please try again later."
+            )
+
+
+class MediaSelectView(discord.ui.View):
+    """Dropdown for search results"""
+    def __init__(self, results: List[dict], user_id: int, services: BotServices):
+        super().__init__(timeout=300)
+        self.results = results
+        self.user_id = user_id
+        self.services = services
+        self.selected_media = None
+        
+        # Build dropdown options
+        options = []
+        for i, result in enumerate(results[:10]):  # Max 10 results
+            title = result.get('title') or result.get('name', 'Unknown')
+            year = self._extract_year(result)
+            media_type = result.get('media_type', 'unknown')
+            
+            label = f"{title}"
+            if year:
+                label += f" ({year})"
+            
+            description = f"{'🎬 Movie' if media_type == 'movie' else '📺 TV Show'}"
+            
+            options.append(discord.SelectOption(
+                label=label[:100],  # Discord limit
+                description=description[:100],
+                value=str(i)
+            ))
+        
+        self.select_menu = discord.ui.Select(
+            placeholder="Choose a title",
+            options=options
+        )
+        self.select_menu.callback = self.select_callback
+        self.add_item(self.select_menu)
+    
+    def _extract_year(self, result: dict) -> Optional[str]:
+        """Extract year from release date"""
+        date_field = result.get('release_date') or result.get('first_air_date')
+        if date_field:
+            return date_field[:4]
+        return None
+    
+    async def select_callback(self, interaction: discord.Interaction):
+        """Handle selection"""
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("This isn't your request!", ephemeral=True)
+            return
+
+        index = int(self.select_menu.values[0])
+        self.selected_media = self.results[index]
+
+        # If TV show, fetch season info and show season selection
+        if self.selected_media.get('media_type') == 'tv':
+            await interaction.response.edit_message(
+                content="📺 Fetching season information...",
+                view=None
+            )
+
+            # Fetch TV show details from TMDB
+            tv_details = await self._fetch_tv_details(self.selected_media.get('id'))
+
+            if tv_details:
+                self.selected_media.update(tv_details)
+                embed = self._create_media_embed(self.selected_media)
+                view = SeasonSelectionView(self.selected_media, self.user_id, self.services)
+
+                await interaction.edit_original_response(
+                    content="**Select which seasons you want:**",
+                    embed=embed,
+                    view=view
+                )
+            else:
+                await interaction.edit_original_response(
+                    content="❌ Failed to fetch season info. Please try again.",
+                    view=None
+                )
+        else:
+            # Movie - show confirmation directly
+            embed = self._create_media_embed(self.selected_media)
+            view = ConfirmationView(self.selected_media, self.user_id, self.services, None)
+
+            await interaction.response.edit_message(
+                content="**Confirm your request:**",
+                embed=embed,
+                view=view
+            )
+
+    async def _fetch_tv_details(self, tv_id: int) -> Optional[dict]:
+        """Fetch TV show details including seasons from TMDB"""
+        if not self.services.config.tmdb_api_key:
+            return None
+
+        try:
+            url = f"https://api.themoviedb.org/3/tv/{tv_id}"
+            params = {"api_key": self.services.config.tmdb_api_key}
+
+            async with self.services.http_session.get(url, params=params) as response:
+                if response.status == 200:
+                    return await response.json()
+        except Exception as e:
+            logger.error(f"Failed to fetch TV details: {e}")
+
+        return None
+    
+    def _create_media_embed(self, media: dict) -> discord.Embed:
+        """Create rich embed for media"""
+        title = media.get('title') or media.get('name', 'Unknown')
+        media_type = media.get('media_type', 'unknown')
+        overview = media.get('overview', 'No description available.')
+
+        embed = discord.Embed(
+            title=title,
+            description=overview[:500] if len(overview) > 500 else overview,
+            color=discord.Color.blue()
+        )
+
+        # Add fields
+        embed.add_field(
+            name="Type",
+            value="🎬 Movie" if media_type == "movie" else "📺 TV Show",
+            inline=True
+        )
+
+        year = self._extract_year(media)
+        if year:
+            embed.add_field(name="Year", value=year, inline=True)
+
+        if media.get('vote_average'):
+            embed.add_field(
+                name="Rating",
+                value=f"⭐ {media['vote_average']:.1f}/10",
+                inline=True
+            )
+
+        # For TV shows, add season information
+        if media_type == 'tv' and media.get('seasons'):
+            # Filter out Season 0 (specials) for display
+            regular_seasons = [s for s in media['seasons'] if s.get('season_number', 0) > 0]
+            if regular_seasons:
+                latest_season = max(regular_seasons, key=lambda s: s.get('season_number', 0))
+                embed.add_field(
+                    name="Seasons",
+                    value=f"{len(regular_seasons)} season{'s' if len(regular_seasons) != 1 else ''}",
+                    inline=True
+                )
+                embed.add_field(
+                    name="Latest Season",
+                    value=f"Season {latest_season.get('season_number')} ({latest_season.get('episode_count', '?')} episodes)",
+                    inline=True
+                )
+
+                # Show status
+                if media.get('status'):
+                    status_emoji = "📺" if media['status'] in ['Returning Series', 'In Production'] else "✅"
+                    embed.add_field(
+                        name="Status",
+                        value=f"{status_emoji} {media['status']}",
+                        inline=True
+                    )
+
+        # Add poster
+        if media.get('poster_path'):
+            poster_url = f"https://image.tmdb.org/t/p/w500{media['poster_path']}"
+            embed.set_thumbnail(url=poster_url)
+
+        return embed
+
+
+class SeasonSelectionView(discord.ui.View):
+    """Season selection for TV shows"""
+    def __init__(self, media: dict, user_id: int, services: BotServices):
+        super().__init__(timeout=300)
+        self.media = media
+        self.user_id = user_id
+        self.services = services
+        self.selected_seasons = None
+
+        # Get regular seasons (exclude Season 0/specials)
+        regular_seasons = [s for s in media.get('seasons', []) if s.get('season_number', 0) > 0]
+
+        if regular_seasons:
+            # Build dropdown options for each season
+            options = []
+            for season in regular_seasons:
+                season_num = season.get('season_number')
+                episode_count = season.get('episode_count', '?')
+                options.append(discord.SelectOption(
+                    label=f"Season {season_num}",
+                    description=f"{episode_count} episodes",
+                    value=str(season_num)
+                ))
+
+            # Add "All Seasons" option
+            options.insert(0, discord.SelectOption(
+                label="All Seasons",
+                description=f"All {len(regular_seasons)} seasons",
+                value="all",
+                emoji="📺"
+            ))
+
+            self.season_select = discord.ui.Select(
+                placeholder="Choose season(s)...",
+                options=options,
+                min_values=1,
+                max_values=len(options)
+            )
+            self.season_select.callback = self.season_select_callback
+            self.add_item(self.season_select)
+
+        # Add "Latest Season + Monitor" button for ongoing shows
+        latest_season = max(regular_seasons, key=lambda s: s.get('season_number', 0))
+        self.latest_season_num = latest_season.get('season_number')
+
+        # Check if show is ongoing
+        is_ongoing = media.get('status') in ['Returning Series', 'In Production']
+
+        if is_ongoing:
+            monitor_button = discord.ui.Button(
+                label=f"Latest (S{self.latest_season_num}) + Monitor",
+                style=discord.ButtonStyle.success,
+                emoji="🔔",
+                row=1
+            )
+            monitor_button.callback = self.latest_with_monitor_callback
+            self.add_item(monitor_button)
+
+        # Add submit button (initially disabled until selection is made)
+        self.submit_button = discord.ui.Button(
+            label="Submit Request",
+            style=discord.ButtonStyle.primary,
+            emoji="✅",
+            disabled=True,
+            row=1 if not is_ongoing else 2
+        )
+        self.submit_button.callback = self.submit_callback
+        self.add_item(self.submit_button)
+
+    async def season_select_callback(self, interaction: discord.Interaction):
+        """Handle season selection from dropdown"""
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("This isn't your request!", ephemeral=True)
+            return
+
+        selected_values = self.season_select.values
+
+        # Check if "all" is selected
+        if "all" in selected_values:
+            self.selected_seasons = "all"
+            seasons_text = "All Seasons"
+        else:
+            self.selected_seasons = [int(v) for v in selected_values]
+            seasons_text = ", ".join([f"S{s}" for s in sorted(self.selected_seasons)])
+
+        # Enable submit button now that user has made a selection
+        self.submit_button.disabled = False
+
+        # Update message to show selection
+        await interaction.response.edit_message(
+            content=f"**Selected:** {seasons_text}\n\nClick **Submit Request** to continue, or select different seasons.",
+            view=self
+        )
+
+    async def submit_callback(self, interaction: discord.Interaction):
+        """Handle submit button after season selection"""
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("This isn't your request!", ephemeral=True)
+            return
+
+        if not self.selected_seasons:
+            await interaction.response.send_message("Please select at least one season first!", ephemeral=True)
+            return
+
+        # Build season text for confirmation
+        if self.selected_seasons == "all":
+            seasons_text = "All Seasons"
+        else:
+            seasons_text = ", ".join([f"Season {s}" for s in sorted(self.selected_seasons)])
+
+        # Show confirmation
+        embed = discord.Embed(
+            title=f"📺 {self.media.get('name', 'Unknown')}",
+            description=f"**Requesting:** {seasons_text}",
+            color=discord.Color.blue()
+        )
+
+        view = ConfirmationView(self.media, self.user_id, self.services, self.selected_seasons)
+
+        await interaction.response.edit_message(
+            content="**Confirm your request:**",
+            embed=embed,
+            view=view
+        )
+
+    async def latest_with_monitor_callback(self, interaction: discord.Interaction):
+        """Handle latest season + monitor selection"""
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("This isn't your request!", ephemeral=True)
+            return
+
+        self.selected_seasons = [self.latest_season_num]
+        monitor = True
+
+        # Show confirmation
+        embed = discord.Embed(
+            title=f"📺 {self.media.get('name', 'Unknown')}",
+            description=f"**Selected:** Season {self.latest_season_num} + Monitor for new episodes 🔔",
+            color=discord.Color.green()
+        )
+
+        view = ConfirmationView(self.media, self.user_id, self.services, self.selected_seasons, monitor=monitor)
+
+        await interaction.response.edit_message(
+            content="**Confirm your request:**",
+            embed=embed,
+            view=view
+        )
+
+
+class BookRequestModal(discord.ui.Modal, title="Request Audiobook or Ebook"):
+    """Modal for collecting book search query"""
+    search_query = discord.ui.TextInput(
+        label="What audiobook or ebook are you looking for?",
+        placeholder="Book title or author",
+        style=discord.TextStyle.short,
+        required=True
+    )
+
+    def __init__(self, cog: 'MediaRequestsCog'):
+        super().__init__()
+        self.cog = cog
+
+    async def on_submit(self, interaction: discord.Interaction):
+        query = self.search_query.value.strip()
+        await interaction.response.send_message("🔍 Searching...", ephemeral=True)
+
+        try:
+            results = await self.cog._search_open_library(query)
+
+            if not results:
+                await interaction.edit_original_response(
+                    content="No results found. Please try a different search term or use `/request` again."
+                )
+                return
+
+            view = BookSelectView(results, interaction.user.id, self.cog.services)
+            await interaction.edit_original_response(
+                content="**I found these titles:**",
+                view=view
+            )
+        except Exception as e:
+            logger.error(f"Book search error after modal submit: {e}")
+            await interaction.edit_original_response(
+                content="An error occurred. Please try again later."
+            )
+
+
+class BookSelectView(discord.ui.View):
+    """Dropdown for book search results"""
+    def __init__(self, results: List[dict], user_id: int, services: BotServices):
+        super().__init__(timeout=300)
+        self.results = results
+        self.user_id = user_id
+        self.services = services
+
+        options = []
+        for i, result in enumerate(results[:10]):
+            title = result.get('title', 'Unknown')
+            author = result.get('author', 'Unknown Author')
+            year = result.get('year')
+
+            label = title
+            if year:
+                label += f" ({year})"
+
+            description = f"by {author}"[:100]
+
+            options.append(discord.SelectOption(
+                label=label[:100],
+                description=description,
+                value=str(i)
+            ))
+
+        self.select_menu = discord.ui.Select(
+            placeholder="Choose a book",
+            options=options
+        )
+        self.select_menu.callback = self.select_callback
+        self.add_item(self.select_menu)
+
+    async def select_callback(self, interaction: discord.Interaction):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("This isn't your request!", ephemeral=True)
+            return
+
+        index = int(self.select_menu.values[0])
+        selected_book = self.results[index]
+
+        # Fetch description from Open Library
+        await interaction.response.edit_message(content="📖 Fetching book details...", view=None)
+        description = await self._fetch_description(selected_book.get('open_library_key'))
+        if description:
+            selected_book['description'] = description
+
+        embed = self._create_book_embed(selected_book)
+        view = BookFormatView(selected_book, self.user_id, self.services)
+
+        await interaction.edit_original_response(
+            content="**Choose your format:**",
+            embed=embed,
+            view=view
+        )
+
+    async def _fetch_description(self, work_key: str) -> Optional[str]:
+        """Fetch book description from Open Library works API"""
+        if not work_key:
+            return None
+        try:
+            url = f"https://openlibrary.org{work_key}.json"
+            async with self.services.http_session.get(url) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    desc = data.get('description')
+                    if isinstance(desc, dict):
+                        return desc.get('value', '')
+                    elif isinstance(desc, str):
+                        return desc
+        except Exception as e:
+            logger.error(f"Failed to fetch book description: {e}")
+        return None
+
+    def _create_book_embed(self, book: dict) -> discord.Embed:
+        title = book.get('title', 'Unknown')
+        author = book.get('author', 'Unknown Author')
+        year = book.get('year')
+
+        embed = discord.Embed(
+            title=title,
+            description=book.get('description', 'No description available.')[:500],
+            color=discord.Color.orange()
+        )
+
+        embed.add_field(name="Author", value=author, inline=True)
+        if year:
+            embed.add_field(name="Year", value=str(year), inline=True)
+        if book.get('pages'):
+            embed.add_field(name="Pages", value=str(book['pages']), inline=True)
+        if book.get('editions'):
+            embed.add_field(name="Editions", value=str(book['editions']), inline=True)
+
+        cover_url = book.get('cover_url')
+        if cover_url:
+            embed.set_thumbnail(url=cover_url)
+
+        return embed
+
+
+class BookFormatView(discord.ui.View):
+    """Format selection buttons for book requests"""
+    def __init__(self, book: dict, user_id: int, services: BotServices):
+        super().__init__(timeout=180)
+        self.book = book
+        self.user_id = user_id
+        self.services = services
+
+    @discord.ui.button(label="Ebook", style=discord.ButtonStyle.primary, emoji="📖")
+    async def ebook(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("This isn't your request!", ephemeral=True)
+            return
+        await self._show_confirmation(interaction, "ebook")
+
+    @discord.ui.button(label="Audiobook", style=discord.ButtonStyle.primary, emoji="🎧")
+    async def audiobook(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("This isn't your request!", ephemeral=True)
+            return
+        await self._show_confirmation(interaction, "audiobook")
+
+    @discord.ui.button(label="Both", style=discord.ButtonStyle.success, emoji="📚")
+    async def both(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("This isn't your request!", ephemeral=True)
+            return
+        await self._show_confirmation(interaction, "both")
+
+    async def _show_confirmation(self, interaction: discord.Interaction, format_type: str):
+        format_labels = {"ebook": "📖 Ebook", "audiobook": "🎧 Audiobook", "both": "📖+🎧 Ebook & Audiobook"}
+        self.book['request_format'] = format_type
+
+        embed = discord.Embed(
+            title=f"📚 {self.book.get('title', 'Unknown')}",
+            description=f"**Format:** {format_labels[format_type]}\n**Author:** {self.book.get('author', 'Unknown')}",
+            color=discord.Color.orange()
+        )
+
+        if self.book.get('cover_url'):
+            embed.set_thumbnail(url=self.book['cover_url'])
+
+        view = BookConfirmationView(self.book, self.user_id, self.services)
+        await interaction.response.edit_message(
+            content="**Confirm your request:**",
+            embed=embed,
+            view=view
+        )
+
+
+class BookConfirmationView(discord.ui.View):
+    """Confirmation buttons for book request"""
+    def __init__(self, book: dict, user_id: int, services: BotServices):
+        super().__init__(timeout=180)
+        self.book = book
+        self.user_id = user_id
+        self.services = services
+
+    @discord.ui.button(label="✅ Yes", style=discord.ButtonStyle.success)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("This isn't your request!", ephemeral=True)
+            return
+
+        await interaction.response.edit_message(
+            content="✅ Request submitted! Waiting for admin approval...",
+            embed=None,
+            view=None
+        )
+
+        await self._send_to_admins(interaction)
+
+    @discord.ui.button(label="❌ No", style=discord.ButtonStyle.danger)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("This isn't your request!", ephemeral=True)
+            return
+
+        await interaction.response.edit_message(
+            content="Request cancelled. Use `/request` to try again.",
+            embed=None,
+            view=None
+        )
+
+    async def _send_to_admins(self, interaction: discord.Interaction):
+        admin_channel_id = int(self.services.config.admin_channel_id or 0)
+        if not admin_channel_id:
+            await interaction.followup.send("❌ Admin channel not configured. Please contact an administrator.", ephemeral=True)
+            return
+
+        admin_channel = interaction.client.get_channel(admin_channel_id)
+        if not admin_channel:
+            logger.error(f"Admin channel {admin_channel_id} not found")
+            return
+
+        title = self.book.get('title', 'Unknown')
+        author = self.book.get('author', 'Unknown Author')
+        format_type = self.book.get('request_format', 'ebook')
+        format_labels = {"ebook": "📖 Ebook", "audiobook": "🎧 Audiobook", "both": "📖+🎧 Both"}
+
+        embed = discord.Embed(
+            title="📥 New Book Request",
+            description=f"**{title}**",
+            color=discord.Color.gold()
+        )
+
+        embed.add_field(name="Requested by", value=f"{interaction.user.mention}", inline=True)
+        embed.add_field(name="Format", value=format_labels.get(format_type, format_type), inline=True)
+        embed.add_field(name="Author", value=author, inline=True)
+
+        if self.book.get('year'):
+            embed.add_field(name="Year", value=str(self.book['year']), inline=True)
+        if self.book.get('isbn'):
+            embed.add_field(name="ISBN", value=self.book['isbn'], inline=True)
+
+        if self.book.get('description'):
+            desc = self.book['description']
+            embed.add_field(
+                name="Description",
+                value=desc[:200] + "..." if len(desc) > 200 else desc,
+                inline=False
+            )
+
+        if self.book.get('cover_url'):
+            embed.set_thumbnail(url=self.book['cover_url'])
+
+        embed.timestamp = datetime.utcnow()
+
+        view = BookAdminApprovalView(self.book, interaction.user.id, self.services)
+        message = await admin_channel.send(embed=embed, view=view)
+
+        # Save request
+        requests_data = {}
+        if REQUESTS_FILE.exists():
+            with open(REQUESTS_FILE) as f:
+                requests_data = json.load(f)
+
+        requests_data[str(message.id)] = {
+            "user_id": interaction.user.id,
+            "media": self.book,
+            "media_type": format_type,
+            "status": "pending",
+            "timestamp": datetime.utcnow().isoformat()
+        }
+
+        with open(REQUESTS_FILE, 'w') as f:
+            json.dump(requests_data, f, indent=2)
+
+
+class BookAdminApprovalView(discord.ui.View):
+    """Admin approval buttons for book requests"""
+    def __init__(self, book: dict = None, user_id: int = None, services: BotServices = None):
+        super().__init__(timeout=None)
+        self.book = book
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item):
+        logger.error(f"BookAdminApprovalView error on {item.custom_id}: {error}", exc_info=True)
+        try:
+            if not interaction.response.is_done():
+                await interaction.response.send_message(f"❌ Error: {error}", ephemeral=True)
+            else:
+                await interaction.followup.send(f"❌ Error: {error}", ephemeral=True)
+        except Exception:
+            pass
+        self.user_id = user_id
+        self.services = services
+
+    def _load_from_saved(self, message_id: int, bot) -> bool:
+        """Load request data from saved requests file after restart"""
+        try:
+            if REQUESTS_FILE.exists():
+                with open(REQUESTS_FILE) as f:
+                    requests_data = json.load(f)
+                req = requests_data.get(str(message_id))
+                if req:
+                    self.book = req.get('media', {})
+                    self.user_id = req.get('user_id')
+                    self.services = bot.services
+                    return True
+        except Exception as e:
+            logger.error(f"Failed to load saved book request: {e}")
+        return False
+
+    @discord.ui.button(label="✅ Approve", style=discord.ButtonStyle.success, custom_id="approve_book_request")
+    async def approve(self, interaction: discord.Interaction, button: discord.ui.Button):
+        logger.info(f"Book approve button clicked by {interaction.user} for message {interaction.message.id}")
+
+        # Disable buttons immediately to prevent double-clicks
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(view=self)
+
+
+        # Always load from saved to ensure we have data
+        if not self._load_from_saved(interaction.message.id, interaction.client):
+            logger.error(f"Could not load book request data for message {interaction.message.id}")
+            await interaction.followup.send("❌ Could not find request data. Please re-submit.", ephemeral=True)
+            return
+
+        logger.info(f"Book data loaded: {self.book.get('title', '?')}, format: {self.book.get('request_format', '?')}")
+
+        # Submit to NZBHydra → SABnzbd with per-format tracking
+        ebook_ok = None
+        audio_ok = None
+        try:
+            format_type = self.book.get('request_format', 'ebook')
+            if format_type == 'both':
+                self.book['request_format'] = 'ebook'
+                ebook_ok = await self._submit_to_download()
+                self.book['request_format'] = 'audiobook'
+                audio_ok = await self._submit_to_download()
+                self.book['request_format'] = 'both'
+                download_success = ebook_ok or audio_ok
+            else:
+                download_success = await self._submit_to_download()
+                if format_type == 'ebook':
+                    ebook_ok = download_success
+                else:
+                    audio_ok = download_success
+        except Exception as e:
+            logger.error(f"Download submission error: {e}", exc_info=True)
+            download_success = False
+
+        logger.info(f"Download result: {download_success} (ebook={ebook_ok}, audiobook={audio_ok})")
+
+        # Build detailed status for admin embed
+        embed = interaction.message.embeds[0]
+        embed.color = discord.Color.green()
+
+        status_text = f"{interaction.user.mention} at {datetime.utcnow().strftime('%Y-%m-%d %H:%M')}"
+        if format_type == 'both':
+            status_text += f"\n📖 Ebook: {'✅ Sent to SABnzbd' if ebook_ok else '❌ Not available'}"
+            status_text += f"\n🎧 Audiobook: {'✅ Sent to SABnzbd' if audio_ok else '❌ Not available'}"
+        elif download_success:
+            status_text += "\n📥 Sent to SABnzbd for download"
+        else:
+            status_text += "\n⚠️ Not available on indexers"
+
+        embed.add_field(name="✅ Approved by", value=status_text, inline=False)
+        await interaction.message.edit(embed=embed, view=None)
+
+        # DM the requesting user with specific status
+        user = interaction.client.get_user(self.user_id)
+        if user:
+            title = self.book.get('title', 'Unknown')
+            if format_type == 'both':
+                msg = f"✅ **Your request for **{title}** has been approved!**\n"
+                if ebook_ok:
+                    msg += "📖 Ebook: Sent for download\n"
+                else:
+                    msg += "📖 Ebook: ⚠️ Not available on indexers\n"
+                if audio_ok:
+                    msg += "🎧 Audiobook: Sent for download"
+                else:
+                    msg += "🎧 Audiobook: ⚠️ Not available on indexers"
+            else:
+                format_label = "📖 Ebook" if format_type == 'ebook' else "🎧 Audiobook"
+                if download_success:
+                    msg = f"✅ **Good news!** Your {format_label.lower()} request for **{title}** has been approved and sent for download!"
+                else:
+                    msg = f"✅ Your request for **{title}** has been approved, but ⚠️ no {format_type} version was found on indexers."
+            try:
+                await user.send(msg)
+            except discord.Forbidden:
+                logger.warning(f"Could not DM user {self.user_id} about book approval")
+
+        await interaction.followup.send(
+            f"Book request approved{' and sent to SABnzbd' if download_success else ' (some formats not available)'}!",
+            ephemeral=True
+        )
+
+    async def _submit_to_download(self) -> bool:
+        """Search NZBHydra for the book and send NZB to SABnzbd for download"""
+        import xml.etree.ElementTree as ET
+        import aiohttp as _aiohttp
+
+        hydra_url = self.services.config.nzbhydra_url
+        hydra_key = self.services.config.nzbhydra_api_key
+        sab_url = self.services.config.sabnzbd_url
+        sab_key = self.services.config.sabnzbd_api_key
+
+        if not hydra_url or not hydra_key:
+            logger.warning("NZBHydra not configured")
+            return False
+        if not sab_url or not sab_key:
+            logger.warning("SABnzbd not configured")
+            return False
+
+        try:
+            _timeout = _aiohttp.ClientTimeout(total=30)
+            title = self.book.get('title', '')
+            author = self.book.get('author', '')
+            format_type = self.book.get('request_format', 'ebook')
+
+            # Determine categories
+            if format_type == 'audiobook':
+                hydra_cat = '3030'
+                sab_cat = 'audiobooks'
+            else:
+                hydra_cat = '7020'
+                sab_cat = 'ebooks'
+
+            search_term = f"{title} {author}".strip()
+            logger.info(f"Searching NZBHydra for: {search_term} (cat={hydra_cat})")
+
+            async with _aiohttp.ClientSession(timeout=_timeout) as session:
+                # 1. Search NZBHydra
+                search_url = f"{hydra_url}/api"
+                params = {
+                    "t": "search",
+                    "q": search_term,
+                    "cat": hydra_cat,
+                    "apikey": hydra_key,
+                    "limit": "20"
+                }
+
+                async with session.get(search_url, params=params) as resp:
+                    if resp.status != 200:
+                        logger.error(f"NZBHydra search failed: {resp.status}")
+                        return False
+                    xml_text = await resp.text()
+
+                # 2. Parse XML results
+                root = ET.fromstring(xml_text)
+
+                # Check for API error
+                error_elem = root.find('.//{http://www.newznab.com/DTD/2010/feeds/attributes/}error')
+                if error_elem is None:
+                    error_elem = root.find('.//error')
+                if error_elem is not None:
+                    logger.error(f"NZBHydra API error: {error_elem.get('description', 'unknown')}")
+                    return False
+
+                items = root.findall('.//item')
+                if not items:
+                    logger.warning(f"No NZBHydra results for: {search_term}")
+                    return False
+
+                logger.info(f"NZBHydra returned {len(items)} results")
+
+                # 3. Filter and rank results
+                ns = {'newznab': 'http://www.newznab.com/DTD/2010/feeds/attributes/'}
+                foreign_indicators = [
+                    'german', 'french', 'spanish', 'deutsch', 'francais',
+                    'italiano', 'portuguese', 'dutch', 'swedish', 'norwegian',
+                    '.de.', '.fr.', '.es.', '.it.', '.nl.', '.pt.',
+                    'hungarian', 'polish', 'czech', 'russian', 'chinese',
+                    'japanese', 'korean', 'arabic', 'turkish'
+                ]
+
+                candidates = []
+                for item in items:
+                    item_title = (item.find('title').text or '').strip()
+                    title_lower = item_title.lower()
+
+                    # Skip foreign language results
+                    if any(ind in title_lower for ind in foreign_indicators):
+                        continue
+
+                    # Get grabs count
+                    grabs = 0
+                    for attr in item.findall('.//newznab:attr', ns):
+                        if attr.get('name') == 'grabs':
+                            try:
+                                grabs = int(attr.get('value', '0'))
+                            except ValueError:
+                                grabs = 0
+
+                    # Get NZB download link
+                    link = item.find('link')
+                    nzb_url = link.text if link is not None else None
+
+                    if not nzb_url:
+                        enclosure = item.find('enclosure')
+                        if enclosure is not None:
+                            nzb_url = enclosure.get('url')
+
+                    if nzb_url:
+                        # Bonus score for EPUB format in ebook searches
+                        has_epub = 'epub' in title_lower
+                        candidates.append({
+                            'title': item_title,
+                            'grabs': grabs,
+                            'has_epub': has_epub,
+                            'nzb_url': nzb_url
+                        })
+
+                if not candidates:
+                    logger.warning(f"No suitable English results for: {search_term}")
+                    return False
+
+                # Sort: prefer EPUB (for ebooks), then by grabs (most downloaded first)
+                if format_type != 'audiobook':
+                    candidates.sort(key=lambda x: (x['has_epub'], x['grabs']), reverse=True)
+                else:
+                    candidates.sort(key=lambda x: x['grabs'], reverse=True)
+
+                best = candidates[0]
+                logger.info(f"Selected: '{best['title']}' ({best['grabs']} grabs, epub={best['has_epub']})")
+
+                # 4. Send NZB to SABnzbd
+                sab_params = {
+                    "mode": "addurl",
+                    "name": best['nzb_url'],
+                    "cat": sab_cat,
+                    "apikey": sab_key,
+                    "output": "json"
+                }
+
+                async with session.get(f"{sab_url}/api", params=sab_params) as resp:
+                    if resp.status != 200:
+                        logger.error(f"SABnzbd API failed: {resp.status}")
+                        return False
+                    result = await resp.json()
+                    if result.get('status'):
+                        logger.info(f"Sent to SABnzbd: '{best['title']}' → category '{sab_cat}'")
+
+                        # Write hint file for bookshelf_processor plugin
+                        try:
+                            watch_dir = self.services.config.bookshelf_ebook_watch if sab_cat == 'ebooks' else self.services.config.bookshelf_audiobook_watch
+                            if watch_dir:
+                                hint_data = {
+                                    "title": self.book.get('title', ''),
+                                    "author": self.book.get('author', ''),
+                                    "year": self.book.get('year'),
+                                    "isbn": self.book.get('isbn'),
+                                    "cover_url": self.book.get('cover_url'),
+                                    "format": format_type,
+                                    "nzb_title": best['title'],
+                                    "requested_by": self.user_id,
+                                }
+                                # Use the NZB title as the hint filename since SABnzbd
+                                # creates a folder with this name
+                                safe_name = re.sub(r'[<>:"/\\|?*]', '_', best['title'])
+                                hint_path = Path(watch_dir) / f".plexbie_hint_{safe_name}.json"
+                                import json as _json
+                                hint_path.write_text(_json.dumps(hint_data, indent=2))
+                                logger.info(f"Wrote hint file: {hint_path.name}")
+                        except Exception as e:
+                            logger.warning(f"Could not write hint file: {e}")
+
+                        return True
+                    else:
+                        logger.error(f"SABnzbd rejected download: {result}")
+                        return False
+
+        except Exception as e:
+            logger.error(f"Failed to submit download: {e}", exc_info=True)
+            return False
+
+    @discord.ui.button(label="❌ Decline", style=discord.ButtonStyle.danger, custom_id="decline_book_request")
+    async def decline(self, interaction: discord.Interaction, button: discord.ui.Button):
+        logger.info(f"Book decline button clicked by {interaction.user} for message {interaction.message.id}")
+        # Always load from saved
+        if not self._load_from_saved(interaction.message.id, interaction.client):
+            await interaction.response.send_message("❌ Could not find request data.", ephemeral=True)
+            return
+
+        embed = interaction.message.embeds[0]
+        embed.color = discord.Color.red()
+        embed.add_field(
+            name="❌ Declined by",
+            value=f"{interaction.user.mention} at {datetime.utcnow().strftime('%Y-%m-%d %H:%M')}",
+            inline=False
+        )
+
+        await interaction.response.edit_message(embed=embed, view=None)
+
+        user = interaction.client.get_user(self.user_id)
+        if user:
+            title = self.book.get('title', 'Unknown')
+            try:
+                await user.send(f"❌ Sorry, your book request for **{title}** was declined.")
+            except discord.Forbidden:
+                logger.warning(f"Could not DM user {self.user_id} about book decline")
+
+
+class ConfirmationView(discord.ui.View):
+    """Confirmation buttons for request"""
+    def __init__(self, media: dict, user_id: int, services: BotServices, seasons=None, monitor=False):
+        super().__init__(timeout=180)
+        self.media = media
+        self.user_id = user_id
+        self.services = services
+        self.seasons = seasons
+        self.monitor = monitor
+    
+    @discord.ui.button(label="✅ Yes", style=discord.ButtonStyle.success)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("This isn't your request!", ephemeral=True)
+            return
+        
+        await interaction.response.edit_message(
+            content="✅ Request submitted! Waiting for admin approval...",
+            embed=None,
+            view=None
+        )
+        
+        # Send to admin channel
+        await self._send_to_admins(interaction)
+    
+    @discord.ui.button(label="❌ No", style=discord.ButtonStyle.danger)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("This isn't your request!", ephemeral=True)
+            return
+        
+        await interaction.response.edit_message(
+            content="Request cancelled. Use `/request` to try again.",
+            embed=None,
+            view=None
+        )
+    
+    async def _send_to_admins(self, interaction: discord.Interaction):
+        """Send request to admin channel for approval"""
+        admin_channel_id = int(self.services.config.admin_channel_id or 0)
+        if not admin_channel_id:
+            await interaction.followup.send("❌ Admin channel not configured. Please contact an administrator.", ephemeral=True)
+            return
+
+        admin_channel = interaction.client.get_channel(admin_channel_id)
+        if not admin_channel:
+            logger.error(f"Admin channel {admin_channel_id} not found")
+            return
+
+        # Create admin embed
+        title = self.media.get('title') or self.media.get('name', 'Unknown')
+        media_type = self.media.get('media_type', 'unknown')
+
+        embed = discord.Embed(
+            title="📥 New Media Request",
+            description=f"**{title}**",
+            color=discord.Color.gold()
+        )
+
+        embed.add_field(name="Requested by", value=f"{interaction.user.mention}", inline=True)
+        embed.add_field(name="Type", value=media_type.title(), inline=True)
+        embed.add_field(name="TMDB ID", value=self.media.get('id', 'N/A'), inline=True)
+
+        # For TV shows, add season information
+        if media_type == 'tv' and self.seasons:
+            if self.seasons == "all":
+                season_text = "All Seasons"
+            else:
+                season_text = ", ".join([f"S{s}" for s in sorted(self.seasons)])
+
+            if self.monitor:
+                season_text += " 🔔 (Monitor enabled)"
+
+            embed.add_field(name="Seasons", value=season_text, inline=False)
+
+        if self.media.get('overview'):
+            embed.add_field(
+                name="Overview",
+                value=self.media['overview'][:200] + "..." if len(self.media['overview']) > 200 else self.media['overview'],
+                inline=False
+            )
+
+        if self.media.get('poster_path'):
+            embed.set_thumbnail(url=f"https://image.tmdb.org/t/p/w500{self.media['poster_path']}")
+
+        embed.timestamp = datetime.utcnow()
+
+        # Admin approval buttons
+        view = AdminApprovalView(self.media, interaction.user.id, self.services, self.seasons, self.monitor)
+
+        message = await admin_channel.send(embed=embed, view=view)
+
+        # Save request
+        self._save_request(interaction.user.id, self.media, message.id, self.seasons, self.monitor)
+    
+    def _save_request(self, user_id: int, media: dict, message_id: int, seasons=None, monitor=False):
+        """Save request to file"""
+        requests = {}
+        if REQUESTS_FILE.exists():
+            with open(REQUESTS_FILE) as f:
+                requests = json.load(f)
+
+        requests[str(message_id)] = {
+            "user_id": user_id,
+            "media": media,
+            "seasons": seasons,
+            "monitor": monitor,
+            "status": "pending",
+            "timestamp": datetime.utcnow().isoformat()
+        }
+
+        with open(REQUESTS_FILE, 'w') as f:
+            json.dump(requests, f, indent=2)
+
+
+class AdminApprovalView(discord.ui.View):
+    """Admin approval buttons"""
+    def __init__(self, media: dict = None, user_id: int = None, services: BotServices = None, seasons=None, monitor=False):
+        super().__init__(timeout=None)  # Persistent
+        self.media = media
+        self.user_id = user_id
+        self.services = services
+        self.seasons = seasons
+        self.monitor = monitor
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item):
+        logger.error(f"AdminApprovalView error on {item.custom_id}: {error}", exc_info=True)
+        try:
+            if not interaction.response.is_done():
+                await interaction.response.send_message(f"❌ Error: {error}", ephemeral=True)
+            else:
+                await interaction.followup.send(f"❌ Error: {error}", ephemeral=True)
+        except Exception:
+            pass
+
+    def _load_from_saved(self, message_id: int, bot) -> bool:
+        """Load request data from saved requests file after restart"""
+        try:
+            if REQUESTS_FILE.exists():
+                with open(REQUESTS_FILE) as f:
+                    requests_data = json.load(f)
+                req = requests_data.get(str(message_id))
+                if req:
+                    self.media = req.get('media', {})
+                    self.user_id = req.get('user_id')
+                    self.seasons = req.get('seasons')
+                    self.monitor = req.get('monitor', False)
+                    self.services = bot.services
+                    return True
+        except Exception as e:
+            logger.error(f"Failed to load saved request: {e}")
+        return False
+
+    def _title(self) -> str:
+        return self.media.get('title') or self.media.get('name', 'Unknown')
+
+    def _requested_seasons_list(self):
+        if self.seasons == "all" or not self.seasons:
+            return None
+        if isinstance(self.seasons, list):
+            return sorted({int(season) for season in self.seasons})
+        return None
+
+    async def _fetch_sonarr_series(self) -> List[Dict[str, Any]]:
+        url = f"{self.services.config.sonarr_url}/api/v3/series"
+        headers = {"X-Api-Key": self.services.config.sonarr_token}
+        async with self.services.http_session.get(url, headers=headers) as response:
+            response.raise_for_status()
+            return await response.json()
+
+    async def _fetch_radarr_movies(self) -> List[Dict[str, Any]]:
+        url = f"{self.services.config.radarr_url}/api/v3/movie"
+        headers = {"X-Api-Key": self.services.config.radarr_token}
+        async with self.services.http_session.get(url, headers=headers) as response:
+            response.raise_for_status()
+            return await response.json()
+
+    async def _set_sonarr_series_monitored(self, series_id: int, monitored: bool):
+        url = f"{self.services.config.sonarr_url}/api/v3/series/editor"
+        headers = {
+            "X-Api-Key": self.services.config.sonarr_token,
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "seriesIds": [series_id],
+            "monitored": monitored,
+        }
+        async with self.services.http_session.put(url, json=payload, headers=headers) as response:
+            response.raise_for_status()
+            return await response.json()
+
+    async def _set_sonarr_episode_monitoring(self, series_id: int, season_numbers, monitored: bool):
+        episode_url = f"{self.services.config.sonarr_url}/api/v3/episode"
+        headers = {"X-Api-Key": self.services.config.sonarr_token}
+        async with self.services.http_session.get(
+            episode_url,
+            params={"seriesId": series_id},
+            headers=headers,
+        ) as response:
+            response.raise_for_status()
+            episodes = await response.json()
+
+        if season_numbers is None:
+            target_ids = [episode["id"] for episode in episodes]
+        else:
+            season_set = {int(season) for season in season_numbers}
+            target_ids = [episode["id"] for episode in episodes if int(episode.get("seasonNumber", 0)) in season_set]
+
+        if not target_ids:
+            return []
+
+        monitor_url = f"{self.services.config.sonarr_url}/api/v3/episode/monitor"
+        payload = {
+            "episodeIds": target_ids,
+            "monitored": monitored,
+        }
+        headers["Content-Type"] = "application/json"
+        async with self.services.http_session.put(monitor_url, json=payload, headers=headers) as response:
+            response.raise_for_status()
+            return await response.json()
+
+    async def _set_radarr_movie_monitored(self, movie_id: int, monitored: bool):
+        url = f"{self.services.config.radarr_url}/api/v3/movie/editor"
+        headers = {
+            "X-Api-Key": self.services.config.radarr_token,
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "movieIds": [movie_id],
+            "monitored": monitored,
+        }
+        async with self.services.http_session.put(url, json=payload, headers=headers) as response:
+            response.raise_for_status()
+            return await response.json()
+
+    async def _restore_existing_request_monitoring(self) -> Optional[Dict[str, str]]:
+        media_type = "movie" if self.media.get('media_type') == 'movie' else "tv"
+        tmdb_id = self.media.get('id')
+        title = self._title()
+
+        if media_type == "movie" and self.services.config.radarr_url and self.services.config.radarr_token:
+            movies = await self._fetch_radarr_movies()
+            match = next((movie for movie in movies if movie.get("tmdbId") == tmdb_id), None)
+            if not match:
+                return None
+
+            if not match.get("monitored", False):
+                await self._set_radarr_movie_monitored(match["id"], True)
+                return {
+                    "mode": "restored",
+                    "admin_note": "Monitoring restored in Radarr (existing item).",
+                    "user_message": f"✅ **Good news!** Your request for **{title}** was approved and should be available shortly.",
+                    "followup_message": "Existing Radarr item found — monitoring turned back on.",
+                }
+
+            return {
+                "mode": "already_monitored",
+                "admin_note": "Already present and already monitored in Radarr.",
+                "user_message": f"✅ **Good news!** Your request for **{title}** was approved and should be available shortly.",
+                "followup_message": "Existing Radarr item was already monitored.",
+            }
+
+        if media_type == "tv" and self.services.config.sonarr_url and self.services.config.sonarr_token:
+            series_list = await self._fetch_sonarr_series()
+            match = next((series for series in series_list if series.get("tmdbId") == tmdb_id), None)
+            if not match:
+                return None
+
+            requested_seasons = self._requested_seasons_list()
+            episode_url = f"{self.services.config.sonarr_url}/api/v3/episode"
+            headers = {"X-Api-Key": self.services.config.sonarr_token}
+            async with self.services.http_session.get(
+                episode_url,
+                params={"seriesId": match["id"]},
+                headers=headers,
+            ) as response:
+                response.raise_for_status()
+                existing_episodes = await response.json()
+
+            if requested_seasons is None:
+                target_episodes = existing_episodes
+            else:
+                season_set = {int(season) for season in requested_seasons}
+                target_episodes = [episode for episode in existing_episodes if int(episode.get("seasonNumber", 0)) in season_set]
+
+            had_unmonitored_targets = any(not episode.get("monitored", False) for episode in target_episodes)
+            if target_episodes:
+                await self._set_sonarr_episode_monitoring(match["id"], requested_seasons, True)
+            needs_series_enable = not match.get("monitored", False)
+            if needs_series_enable:
+                await self._set_sonarr_series_monitored(match["id"], True)
+
+            restored_any = needs_series_enable or had_unmonitored_targets
+            if restored_any:
+                scope = "requested seasons" if requested_seasons else "series"
+                return {
+                    "mode": "restored",
+                    "admin_note": f"Monitoring restored in Sonarr for existing {scope}.",
+                    "user_message": f"✅ **Good news!** Your request for **{title}** was approved and should be available shortly.",
+                    "followup_message": "Existing Sonarr item found — monitoring turned back on.",
+                }
+
+            return {
+                "mode": "already_monitored",
+                "admin_note": "Already present and already monitored in Sonarr.",
+                "user_message": f"✅ **Good news!** Your request for **{title}** was approved and should be available shortly.",
+                "followup_message": "Existing Sonarr item was already monitored.",
+            }
+
+        return None
+
+    async def _fulfill_request(self) -> Dict[str, Any]:
+        try:
+            restored = await self._restore_existing_request_monitoring()
+            if restored:
+                restored["success"] = True
+                return restored
+        except Exception as e:
+            logger.error(f"Failed to restore monitoring for existing media: {e}", exc_info=True)
+
+        submitted = await self._submit_to_overseerr()
+        title = self._title()
+        if submitted:
+            return {
+                "success": True,
+                "mode": "overseerr",
+                "admin_note": "Submitted to Overseerr.",
+                "user_message": f"✅ **Good news!** Your request for **{title}** was approved and should be available shortly.",
+                "followup_message": "Request approved and submitted to Overseerr!",
+            }
+
+        return {
+            "success": False,
+            "mode": "failed",
+            "followup_message": "Failed to submit to Overseerr or restore monitoring. Please try manually.",
+        }
+
+    @discord.ui.button(label="✅ Approve", style=discord.ButtonStyle.success, custom_id="approve_request")
+    async def approve(self, interaction: discord.Interaction, button: discord.ui.Button):
+        logger.info(f"Media approve button clicked by {interaction.user} for message {interaction.message.id}")
+        try:
+            await interaction.response.defer()
+        except Exception as e:
+            logger.error(f"Failed to defer media approval: {e}")
+            return
+
+        # Always load from saved to ensure we have data
+        if not self._load_from_saved(interaction.message.id, interaction.client):
+            logger.error(f"Could not load media request data for message {interaction.message.id}")
+            await interaction.followup.send("❌ Could not find request data. Please re-submit.", ephemeral=True)
+            return
+
+        # Fulfill by restoring monitoring if the item already exists, otherwise submit to Overseerr
+        result = await self._fulfill_request()
+        
+        if result.get("success"):
+            # Update message
+            embed = interaction.message.embeds[0]
+            embed.color = discord.Color.green()
+            embed.add_field(
+                name="✅ Approved by",
+                value=(
+                    f"{interaction.user.mention} at {datetime.utcnow().strftime('%Y-%m-%d %H:%M')}"
+                    f"\n{result.get('admin_note', '')}"
+                ).strip(),
+                inline=False
+            )
+            
+            await interaction.message.edit(embed=embed, view=None)
+            
+            # Notify user
+            user = interaction.client.get_user(self.user_id)
+            if user:
+                await user.send(result["user_message"])
+
+            # Register with media tracking system
+            await self._register_with_tracking()
+
+            await interaction.followup.send(result["followup_message"], ephemeral=True)
+        else:
+            await interaction.followup.send(result["followup_message"], ephemeral=True)
+    
+    @discord.ui.button(label="❌ Decline", style=discord.ButtonStyle.danger, custom_id="decline_request")
+    async def decline(self, interaction: discord.Interaction, button: discord.ui.Button):
+        logger.info(f"Media decline button clicked by {interaction.user} for message {interaction.message.id}")
+        # Always load from saved
+        if not self._load_from_saved(interaction.message.id, interaction.client):
+            await interaction.response.send_message("❌ Could not find request data.", ephemeral=True)
+            return
+
+        # Update message
+        embed = interaction.message.embeds[0]
+        embed.color = discord.Color.red()
+        embed.add_field(
+            name="❌ Declined by",
+            value=f"{interaction.user.mention} at {datetime.utcnow().strftime('%Y-%m-%d %H:%M')}",
+            inline=False
+        )
+        
+        await interaction.response.edit_message(embed=embed, view=None)
+        
+        # Notify user
+        user = interaction.client.get_user(self.user_id)
+        if user:
+            title = self.media.get('title') or self.media.get('name', 'Unknown')
+            await user.send(f"❌ Sorry, your request for **{title}** was declined.")
+    
+    async def _register_with_tracking(self):
+        """Register approved request with media tracking system"""
+        try:
+            from core.media_tracking import get_media_tracker
+
+            tracker = get_media_tracker()
+
+            title = self.media.get('title') or self.media.get('name', 'Unknown')
+            tmdb_id = self.media.get('id')
+            media_type = "movie" if self.media.get('media_type') == 'movie' else "tv"
+
+            # Get poster URL
+            poster_path = self.media.get('poster_path')
+            poster_url = f"https://image.tmdb.org/t/p/w500{poster_path}" if poster_path else None
+
+            overview = self.media.get('overview', 'No description available.')
+
+            # For TV shows, register each season separately
+            if media_type == "tv":
+                if isinstance(self.seasons, list):
+                    # Specific seasons requested
+                    for season_num in self.seasons:
+                        tracker.register_request(
+                            tmdb_id=tmdb_id,
+                            media_type="tv",
+                            title=title,
+                            requester_user_id=self.user_id,
+                            season_number=season_num,
+                            requested_seasons=self.seasons,
+                            monitor=self.monitor,
+                            poster_url=poster_url,
+                            overview=overview,
+                        )
+                elif self.seasons == "all":
+                    # All seasons - register with season_number=None for now
+                    # Will be updated when Sonarr grabs episodes
+                    tracker.register_request(
+                        tmdb_id=tmdb_id,
+                        media_type="tv",
+                        title=title,
+                        requester_user_id=self.user_id,
+                        season_number=None,
+                        requested_seasons="all",
+                        monitor=self.monitor,
+                        poster_url=poster_url,
+                        overview=overview,
+                    )
+            else:
+                # Movie
+                tracker.register_request(
+                    tmdb_id=tmdb_id,
+                    media_type="movie",
+                    title=title,
+                    requester_user_id=self.user_id,
+                    monitor=self.monitor,
+                    poster_url=poster_url,
+                    overview=overview,
+                )
+
+            logger.info(f"Registered tracking for {media_type}: {title} (TMDB: {tmdb_id})")
+
+        except Exception as e:
+            logger.error(f"Error registering with tracking system: {e}", exc_info=True)
+
+    async def _submit_to_overseerr(self) -> bool:
+        """Submit request to Overseerr API"""
+        if not self.services.config.overseerr_url or not self.services.config.overseerr_token:
+            logger.warning("Overseerr not configured")
+            return False
+
+        try:
+            url = f"{self.services.config.overseerr_url}/api/v1/request"
+            headers = {
+                "X-Api-Key": self.services.config.overseerr_token,
+                "Content-Type": "application/json"
+            }
+
+            media_type = "movie" if self.media.get('media_type') == 'movie' else "tv"
+
+            payload = {
+                "mediaType": media_type,
+                "mediaId": self.media.get('id')
+            }
+
+            # For TV shows, add season selection
+            if media_type == "tv":
+                if self.seasons == "all":
+                    payload["seasons"] = "all"
+                elif self.seasons:
+                    # Specific seasons selected
+                    payload["seasons"] = self.seasons
+                else:
+                    # Default to all seasons if none specified
+                    payload["seasons"] = "all"
+
+                # Add monitoring if requested
+                if self.monitor:
+                    payload["is4k"] = False  # Assuming non-4K for now
+                    # Note: Overseerr doesn't have a direct "monitor" flag
+                    # Monitoring is typically handled by Sonarr/Radarr after the request
+                    # We're just requesting the specific season(s)
+
+            async with self.services.http_session.post(url, json=payload, headers=headers) as response:
+                if response.status in [200, 201]:
+                    logger.info(f"Successfully submitted request to Overseerr: {self.media.get('title')} - Seasons: {self.seasons}")
+                    return True
+                else:
+                    error_text = await response.text()
+                    logger.error(f"Overseerr API error: {response.status} - {error_text}")
+                    return False
+
+        except Exception as e:
+            logger.error(f"Failed to submit to Overseerr: {e}")
+            return False
+
+
+class MediaRequestsCog(commands.Cog):
+    """Media request system with ephemeral in-channel flow and admin approval"""
+
+    def __init__(self, bot: commands.Bot, services: BotServices):
+        self.bot = bot
+        self.services = services
+
+        # Ensure requests file exists
+        REQUESTS_FILE.parent.mkdir(exist_ok=True)
+        if not REQUESTS_FILE.exists():
+            REQUESTS_FILE.write_text("{}")
+
+    @app_commands.command(name="request", description="Request media (TV, Movie, Audiobook, or Ebook)")
+    async def request_media(self, interaction: discord.Interaction):
+        """Start media request flow — choose media type first"""
+        view = MediaTypeSelectView(cog=self, user_id=interaction.user.id)
+        await interaction.response.send_message(
+            "**What would you like to request?**",
+            view=view,
+            ephemeral=True
+        )
+    
+    async def _search_open_library(self, query: str) -> List[dict]:
+        """Search Open Library for books"""
+        try:
+            url = "https://openlibrary.org/search.json"
+            params = {
+                "q": query,
+                "limit": 10,
+                "fields": "key,title,author_name,first_publish_year,cover_edition_key,isbn,edition_count,number_of_pages_median,subject"
+            }
+
+            async with self.services.http_session.get(url, params=params) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    results = []
+                    for doc in data.get('docs', [])[:10]:
+                        authors = doc.get('author_name', [])
+                        cover_key = doc.get('cover_edition_key')
+                        isbns = doc.get('isbn', [])
+
+                        result = {
+                            'title': doc.get('title', 'Unknown'),
+                            'author': ', '.join(authors[:2]) if authors else 'Unknown Author',
+                            'year': doc.get('first_publish_year'),
+                            'cover_url': f"https://covers.openlibrary.org/b/olid/{cover_key}-M.jpg" if cover_key else None,
+                            'isbn': isbns[0] if isbns else None,
+                            'editions': doc.get('edition_count'),
+                            'pages': doc.get('number_of_pages_median'),
+                            'open_library_key': doc.get('key'),
+                            'subjects': doc.get('subject', [])[:5],
+                        }
+                        results.append(result)
+                    return results
+
+        except Exception as e:
+            logger.error(f"Open Library search error: {e}")
+
+        return []
+
+    async def _search_tmdb(self, query: str) -> List[dict]:
+        """Search TMDB for media"""
+        if not self.services.config.tmdb_api_key:
+            # Mock data for testing
+            return [
+                {
+                    "id": 1,
+                    "title": query,
+                    "media_type": "movie",
+                    "overview": "Mock movie result",
+                    "release_date": "2024-01-01",
+                    "vote_average": 8.0
+                }
+            ]
+        
+        try:
+            url = "https://api.themoviedb.org/3/search/multi"
+            params = {
+                "api_key": self.services.config.tmdb_api_key,
+                "query": query,
+                "include_adult": "false"
+            }
+            
+            async with self.services.http_session.get(url, params=params) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    # Filter to only movies and TV shows
+                    return [r for r in data.get('results', []) 
+                           if r.get('media_type') in ['movie', 'tv']]
+                    
+        except Exception as e:
+            logger.error(f"TMDB search error: {e}")
+        
+        return []
+
+
+
+async def setup(bot: commands.Bot):
+    """Setup function for loading cog"""
+    # Register persistent views so approve/decline buttons work after restart
+    bot.add_view(AdminApprovalView())
+    bot.add_view(BookAdminApprovalView())
+    await bot.add_cog(MediaRequestsCog(bot, bot.services))

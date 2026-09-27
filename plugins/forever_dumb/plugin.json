@@ -1,0 +1,9 @@
+{
+    "name": "forever_dumb",
+    "version": "1.0.0",
+    "description": "Forever Dumb role with nickname enforcement",
+    "author": "Plexbie",
+    "enabled": true,
+    "dependencies": [],
+    "commands": []
+}

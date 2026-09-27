@@ -1,0 +1,12 @@
+{
+    "name": "media_requests",
+    "version": "1.0.0",
+    "description": "Media request system with Overseerr integration",
+    "author": "Plexbie",
+    "enabled": true,
+    "dependencies": [],
+    "commands": [
+        "/request",
+        "/requests"
+    ]
+}

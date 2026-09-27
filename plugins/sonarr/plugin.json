@@ -1,0 +1,12 @@
+{
+    "name": "sonarr",
+    "version": "1.0.0",
+    "description": "TV show management via Sonarr",
+    "author": "Plexbie",
+    "enabled": false,
+    "dependencies": ["pyarr"],
+    "commands": [
+        "/sonarr search",
+        "/sonarr add"
+    ]
+}

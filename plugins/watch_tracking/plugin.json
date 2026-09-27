@@ -1,0 +1,13 @@
+{
+    "name": "watch_tracking",
+    "version": "1.0.0",
+    "description": "Watch history, streaks, and leaderboards",
+    "author": "Plexbie",
+    "enabled": true,
+    "dependencies": [],
+    "commands": [
+        "/leaderboard",
+        "/streaks",
+        "/now-watching"
+    ]
+}

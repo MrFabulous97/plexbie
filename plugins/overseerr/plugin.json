@@ -1,0 +1,13 @@
+{
+    "name": "overseerr",
+    "version": "1.0.0",
+    "description": "Media requests via Overseerr",
+    "author": "Plexbie",
+    "enabled": false,
+    "dependencies": [],
+    "commands": [
+        "/request movie",
+        "/request show",
+        "/request status"
+    ]
+}

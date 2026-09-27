@@ -1,0 +1,1370 @@
+# path: plugins/media_cleanup/cog.py
+"""Media cleanup plugin - removes unwatched content after 3 months"""
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+import json
+from typing import Optional, List, Dict, Any
+
+import discord
+from discord import app_commands
+from discord.ext import commands, tasks
+from discord.ui import Button, View
+
+from core.logging import get_logger
+from core.services import BotServices
+from utils.embeds import create_info_embed, create_error_embed
+from database.kv_store import kv_get, kv_set
+
+logger = get_logger(__name__)
+
+# Namespace for cleanup data
+CLEANUP_NAMESPACE = "media_cleanup"
+REQUESTS_FILE = Path("config/media_requests.json")
+NEW_MEDIA_TRACKING_FILE = Path("config/new_media_tracking.json")
+REQUEST_EXPIRY_DAYS = 90
+
+# Default configuration
+DEFAULT_CONFIG = {
+    "enabled": True,
+    "inactivity_days": 90,  # 3 months
+    "dry_run": True,  # Set to False to actually delete
+    "exclude_libraries": [],  # Library names to exclude from cleanup
+    "exempt_items": {},  # rating_key -> {title, type, added_at, exempted_at}
+    "notification_channel_id": None,
+    "notify_days_before": 7,  # Warn 7 days before deletion
+}
+
+
+class CleanupControlPanel(View):
+    """Interactive control panel for media cleanup"""
+
+    def __init__(self, cog):
+        super().__init__(timeout=None)  # Persistent view
+        self.cog = cog
+
+    @discord.ui.button(label="📊 View Status", style=discord.ButtonStyle.primary, custom_id="cleanup_status")
+    async def status_button(self, interaction: discord.Interaction, button: Button):
+        """Show current cleanup status"""
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message(
+                "You don't have permission to use this.",
+                ephemeral=True
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True)
+
+        try:
+            embed = discord.Embed(
+                title="🗑️ Media Cleanup Status",
+                description="Current configuration and statistics",
+                color=discord.Color.blue()
+            )
+
+            status = "✅ Enabled" if self.cog.config["enabled"] else "❌ Disabled"
+            mode = "🔵 Dry Run" if self.cog.config["dry_run"] else "🔴 Live Mode"
+
+            embed.add_field(name="Status", value=status, inline=True)
+            embed.add_field(name="Mode", value=mode, inline=True)
+            embed.add_field(
+                name="Inactivity Threshold",
+                value=f"{self.cog.config['inactivity_days']} days",
+                inline=True
+            )
+            embed.add_field(
+                name="Warning Period",
+                value=f"{self.cog.config['notify_days_before']} days before deletion",
+                inline=True
+            )
+
+            if self.cog.config["exclude_libraries"]:
+                embed.add_field(
+                    name="Excluded Libraries",
+                    value="\n".join(f"• {lib}" for lib in self.cog.config["exclude_libraries"]),
+                    inline=False
+                )
+
+            exempt_count = len(self.cog.config.get("exempt_items", {}))
+            embed.add_field(
+                name="Exempt Media",
+                value=f"{exempt_count} item(s)",
+                inline=True
+            )
+
+            total_deleted = len(self.cog.tracking_data)
+            embed.add_field(
+                name="Total Items Cleaned",
+                value=f"{total_deleted} items",
+                inline=True
+            )
+
+            await interaction.followup.send(embed=embed, ephemeral=True)
+
+        except Exception as e:
+            logger.error(f"Error showing status: {e}")
+            await interaction.followup.send(f"Error: {str(e)}", ephemeral=True)
+
+    @discord.ui.button(label="🔄 Run Scan Now", style=discord.ButtonStyle.success, custom_id="cleanup_run")
+    async def run_button(self, interaction: discord.Interaction, button: Button):
+        """Run cleanup scan immediately"""
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message(
+                "You don't have permission to use this.",
+                ephemeral=True
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True)
+
+        try:
+            if not self.cog.config["enabled"]:
+                await interaction.followup.send(
+                    "⚠️ Media cleanup is currently disabled. Enable it first using the ⚙️ Settings button.",
+                    ephemeral=True
+                )
+                return
+
+            mode_text = "🔵 **DRY RUN MODE**" if self.cog.config["dry_run"] else "🔴 **LIVE MODE**"
+
+            embed = discord.Embed(
+                title="🔄 Running Cleanup Scan...",
+                description=f"{mode_text}\n\nScanning all libraries for inactive media...",
+                color=discord.Color.blue() if self.cog.config["dry_run"] else discord.Color.red()
+            )
+
+            await interaction.followup.send(embed=embed, ephemeral=True)
+
+            # Run the cleanup check
+            await self.cog.run_cleanup_scan(interaction)
+
+        except Exception as e:
+            logger.error(f"Error running scan: {e}")
+            await interaction.followup.send(f"❌ Error: {str(e)}", ephemeral=True)
+
+    @discord.ui.button(label="⚙️ Settings", style=discord.ButtonStyle.secondary, custom_id="cleanup_settings")
+    async def settings_button(self, interaction: discord.Interaction, button: Button):
+        """Show settings menu"""
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message(
+                "You don't have permission to use this.",
+                ephemeral=True
+            )
+            return
+
+        view = CleanupSettingsView(self.cog)
+        embed = discord.Embed(
+            title="⚙️ Cleanup Settings",
+            description="Configure media cleanup behavior",
+            color=discord.Color.gold()
+        )
+
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+    @discord.ui.button(label="🔴 Toggle Dry Run", style=discord.ButtonStyle.danger, custom_id="cleanup_toggle_dry")
+    async def toggle_dry_run_button(self, interaction: discord.Interaction, button: Button):
+        """Toggle dry run mode"""
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message(
+                "You don't have permission to use this.",
+                ephemeral=True
+            )
+            return
+
+        self.cog.config["dry_run"] = not self.cog.config["dry_run"]
+        await self.cog.save_config()
+
+        mode = "🔵 Dry Run (Safe)" if self.cog.config["dry_run"] else "🔴 Live Mode (Deletes Files)"
+
+        embed = discord.Embed(
+            title="✅ Dry Run Mode Toggled",
+            description=f"Current mode: **{mode}**",
+            color=discord.Color.blue() if self.cog.config["dry_run"] else discord.Color.red()
+        )
+
+        if not self.cog.config["dry_run"]:
+            embed.add_field(
+                name="⚠️ Warning",
+                value="Live mode is now active. The next scan will **permanently delete files**!",
+                inline=False
+            )
+
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        logger.info(f"{interaction.user} toggled dry run to: {self.cog.config['dry_run']}")
+
+
+class CleanupSettingsView(View):
+    """Settings submenu for cleanup configuration"""
+
+    def __init__(self, cog):
+        super().__init__(timeout=180)
+        self.cog = cog
+
+    @discord.ui.button(label="✅ Enable/Disable", style=discord.ButtonStyle.secondary)
+    async def toggle_enabled(self, interaction: discord.Interaction, button: Button):
+        """Toggle cleanup enabled/disabled"""
+        self.cog.config["enabled"] = not self.cog.config["enabled"]
+        await self.cog.save_config()
+
+        status = "✅ Enabled" if self.cog.config["enabled"] else "❌ Disabled"
+        await interaction.response.send_message(
+            f"Cleanup is now: **{status}**",
+            ephemeral=True
+        )
+
+    @discord.ui.button(label="📅 Set Days (90)", style=discord.ButtonStyle.secondary)
+    async def set_days(self, interaction: discord.Interaction, button: Button):
+        """Show instructions for setting inactivity days"""
+        embed = discord.Embed(
+            title="📅 Set Inactivity Days",
+            description=f"Current: **{self.cog.config['inactivity_days']} days**\n\nTo change, use:\n`/cleanup-config inactivity_days:<number>`",
+            color=discord.Color.blue()
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @discord.ui.button(label="📢 Set Notification Channel", style=discord.ButtonStyle.secondary)
+    async def set_channel(self, interaction: discord.Interaction, button: Button):
+        """Show instructions for setting notification channel"""
+        current_channel = "Not set"
+        if self.cog.config.get("notification_channel_id"):
+            channel = interaction.guild.get_channel(self.cog.config["notification_channel_id"])
+            if channel:
+                current_channel = channel.mention
+
+        embed = discord.Embed(
+            title="📢 Set Notification Channel",
+            description=f"Current: {current_channel}\n\nTo change, use:\n`/cleanup-config notification_channel:#your-channel`",
+            color=discord.Color.blue()
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+class MediaCleanupCog(commands.Cog):
+    """Handle automatic cleanup of unwatched media"""
+
+    def __init__(self, bot: commands.Bot, services: BotServices):
+        self.bot = bot
+        self.services = services
+        self.config = DEFAULT_CONFIG.copy()
+        self.tracking_data = {}
+        self._data_loaded = False
+        self.daily_cleanup_check.start()
+
+        # Register persistent view
+        self.bot.add_view(CleanupControlPanel(self))
+
+    def cog_unload(self):
+        """Cleanup when cog is unloaded"""
+        self.daily_cleanup_check.cancel()
+        # Note: Can't await in cog_unload, data will be saved after each operation
+
+    async def load_data(self):
+        """Load config and tracking data from database"""
+        if self._data_loaded:
+            return
+        try:
+            # Load config
+            saved_config = await kv_get(CLEANUP_NAMESPACE, "config", {})
+            self.config = {**DEFAULT_CONFIG, **saved_config}
+
+            # Load tracking data
+            self.tracking_data = await kv_get(CLEANUP_NAMESPACE, "tracking", {})
+
+            exempt_items = self.config.get("exempt_items", {})
+            if isinstance(exempt_items, list):
+                self.config["exempt_items"] = {str(item): {"title": "Unknown", "type": "unknown"} for item in exempt_items}
+            elif not isinstance(exempt_items, dict):
+                self.config["exempt_items"] = {}
+
+            self._data_loaded = True
+            logger.info("Loaded media cleanup data from database")
+        except Exception as e:
+            logger.error(f"Error loading cleanup data: {e}")
+
+    async def save_config(self):
+        """Save cleanup configuration"""
+        try:
+            await kv_set(CLEANUP_NAMESPACE, "config", self.config)
+        except Exception as e:
+            logger.error(f"Error saving cleanup config: {e}")
+
+    async def save_tracking_data(self):
+        """Save tracking data"""
+        try:
+            await kv_set(CLEANUP_NAMESPACE, "tracking", self.tracking_data)
+        except Exception as e:
+            logger.error(f"Error saving tracking data: {e}")
+
+    def _load_json_file(self, path: Path, default):
+        try:
+            if not path.exists():
+                return default
+            with open(path) as f:
+                return json.load(f)
+        except Exception as e:
+            logger.error(f"Failed to load JSON file {path}: {e}")
+            return default
+
+    def _save_json_file(self, path: Path, data):
+        with open(path, "w") as f:
+            json.dump(data, f, indent=2)
+
+    def _normalize_title(self, value: Optional[str]) -> str:
+        if not value:
+            return ""
+        return "".join(ch for ch in value.casefold() if ch.isalnum())
+
+    def _latest_requests_by_media(self, requests_data: Dict[str, Any]) -> Dict[tuple, Dict[str, Any]]:
+        latest = {}
+        for request in requests_data.values():
+            media = request.get("media", {})
+            tmdb_id = media.get("id")
+            media_type = media.get("media_type") or ("movie" if media.get("title") else "tv")
+            timestamp = self._parse_request_timestamp(request.get("timestamp"))
+            if not tmdb_id or not timestamp:
+                continue
+            key = (media_type, int(tmdb_id))
+            if key not in latest or timestamp > latest[key]["timestamp"]:
+                latest[key] = {
+                    "timestamp": timestamp,
+                    "media": media,
+                    "seasons": request.get("seasons"),
+                    "monitor": request.get("monitor", False),
+                }
+        return latest
+
+    async def _fetch_sonarr_series(self) -> List[Dict[str, Any]]:
+        url = f"{self.services.config.sonarr_url}/api/v3/series"
+        headers = {"X-Api-Key": self.services.config.sonarr_token}
+        async with self.services.http_session.get(url, headers=headers) as response:
+            response.raise_for_status()
+            return await response.json()
+
+    async def _fetch_sonarr_episodes(self, series_id: int) -> List[Dict[str, Any]]:
+        url = f"{self.services.config.sonarr_url}/api/v3/episode"
+        headers = {"X-Api-Key": self.services.config.sonarr_token}
+        async with self.services.http_session.get(url, params={"seriesId": series_id}, headers=headers) as response:
+            response.raise_for_status()
+            return await response.json()
+
+    async def _set_sonarr_series_monitored(self, series_id: int, monitored: bool):
+        url = f"{self.services.config.sonarr_url}/api/v3/series/editor"
+        headers = {"X-Api-Key": self.services.config.sonarr_token, "Content-Type": "application/json"}
+        payload = {"seriesIds": [series_id], "monitored": monitored}
+        async with self.services.http_session.put(url, json=payload, headers=headers) as response:
+            response.raise_for_status()
+            return await response.json()
+
+    async def _set_sonarr_episode_monitoring(self, series_id: int, season_numbers, monitored: bool):
+        episodes = await self._fetch_sonarr_episodes(series_id)
+        if season_numbers is None:
+            episode_ids = [episode["id"] for episode in episodes]
+        else:
+            season_set = {int(season) for season in season_numbers}
+            episode_ids = [episode["id"] for episode in episodes if int(episode.get("seasonNumber", 0)) in season_set]
+
+        if not episode_ids:
+            return []
+
+        url = f"{self.services.config.sonarr_url}/api/v3/episode/monitor"
+        headers = {"X-Api-Key": self.services.config.sonarr_token, "Content-Type": "application/json"}
+        payload = {"episodeIds": episode_ids, "monitored": monitored}
+        async with self.services.http_session.put(url, json=payload, headers=headers) as response:
+            response.raise_for_status()
+            return await response.json()
+
+    async def _fetch_radarr_movies(self) -> List[Dict[str, Any]]:
+        url = f"{self.services.config.radarr_url}/api/v3/movie"
+        headers = {"X-Api-Key": self.services.config.radarr_token}
+        async with self.services.http_session.get(url, headers=headers) as response:
+            response.raise_for_status()
+            return await response.json()
+
+    async def _set_radarr_movie_monitored(self, movie_id: int, monitored: bool):
+        url = f"{self.services.config.radarr_url}/api/v3/movie/editor"
+        headers = {"X-Api-Key": self.services.config.radarr_token, "Content-Type": "application/json"}
+        payload = {"movieIds": [movie_id], "monitored": monitored}
+        async with self.services.http_session.put(url, json=payload, headers=headers) as response:
+            response.raise_for_status()
+            return await response.json()
+
+    def _prune_media_tracking_cache(self, latest_requests: Dict[tuple, Dict[str, Any]], cutoff: datetime) -> int:
+        from core.media_tracking import get_media_tracker
+
+        tracker = get_media_tracker()
+        to_remove = []
+        for key, tracked in tracker.tracked_media.items():
+            request_ts = self._parse_request_timestamp(getattr(tracked, "request_timestamp", None))
+            if not request_ts or request_ts >= cutoff:
+                continue
+
+            latest_for_media = latest_requests.get((tracked.media_type, tracked.tmdb_id))
+            if latest_for_media and latest_for_media["timestamp"] >= cutoff:
+                continue
+            to_remove.append(key)
+
+        for key in to_remove:
+            del tracker.tracked_media[key]
+
+        if to_remove:
+            tracker.save_tracking_data()
+            logger.info(f"Pruned {len(to_remove)} stale media tracking entries")
+        return len(to_remove)
+
+    def _prune_new_media_tracking_cache(self, latest_requests: Dict[tuple, Dict[str, Any]], cutoff: datetime) -> int:
+        data = self._load_json_file(NEW_MEDIA_TRACKING_FILE, {})
+        if not data:
+            return 0
+
+        kept = {}
+        removed = 0
+        for key, value in data.items():
+            last_update = self._parse_request_timestamp(value.get("last_update"))
+            if not last_update or last_update >= cutoff:
+                kept[key] = value
+                continue
+
+            title_key = self._normalize_title(value.get("show_title"))
+            season = int(value.get("season") or 0)
+            has_recent_request = False
+            for (media_type, _tmdb_id), request in latest_requests.items():
+                if media_type != "tv" or request["timestamp"] < cutoff:
+                    continue
+                media_title = self._normalize_title(request["media"].get("title") or request["media"].get("name"))
+                seasons = request.get("seasons")
+                season_match = seasons == "all" or not seasons or (isinstance(seasons, list) and season in {int(s) for s in seasons})
+                if media_title == title_key and season_match:
+                    has_recent_request = True
+                    break
+
+            if has_recent_request:
+                kept[key] = value
+            else:
+                removed += 1
+
+        if removed:
+            self._save_json_file(NEW_MEDIA_TRACKING_FILE, kept)
+            logger.info(f"Pruned {removed} stale new-media tracking entries")
+        return removed
+
+    async def enforce_request_monitor_cleanup(self) -> Dict[str, int]:
+        requests_data = self._load_json_file(REQUESTS_FILE, {})
+        latest_requests = self._latest_requests_by_media(requests_data)
+        cutoff = datetime.now(timezone.utc) - timedelta(days=REQUEST_EXPIRY_DAYS)
+        summary = {
+            "tv_unmonitored": 0,
+            "tv_reenabled": 0,
+            "movie_unmonitored": 0,
+            "movie_reenabled": 0,
+            "media_tracking_pruned": 0,
+            "new_media_tracking_pruned": 0,
+        }
+
+        try:
+            sonarr_by_tmdb = {}
+            if self.services.config.sonarr_url and self.services.config.sonarr_token:
+                sonarr_by_tmdb = {series.get("tmdbId"): series for series in await self._fetch_sonarr_series()}
+
+            for (media_type, tmdb_id), request in latest_requests.items():
+                if media_type != "tv":
+                    continue
+                series = sonarr_by_tmdb.get(tmdb_id)
+                if not series:
+                    continue
+
+                requested_seasons = request.get("seasons") if isinstance(request.get("seasons"), list) else None
+                is_active = request["timestamp"] >= cutoff
+                if is_active:
+                    if not series.get("monitored", False):
+                        await self._set_sonarr_series_monitored(series["id"], True)
+                        summary["tv_reenabled"] += 1
+                    await self._set_sonarr_episode_monitoring(series["id"], requested_seasons, True)
+                else:
+                    if series.get("monitored", False):
+                        await self._set_sonarr_series_monitored(series["id"], False)
+                        summary["tv_unmonitored"] += 1
+                    await self._set_sonarr_episode_monitoring(series["id"], None, False)
+        except Exception as e:
+            logger.error(f"Error enforcing Sonarr request monitoring cleanup: {e}", exc_info=True)
+
+        try:
+            radarr_by_tmdb = {}
+            if self.services.config.radarr_url and self.services.config.radarr_token:
+                radarr_by_tmdb = {movie.get("tmdbId"): movie for movie in await self._fetch_radarr_movies()}
+
+            for (media_type, tmdb_id), request in latest_requests.items():
+                if media_type != "movie":
+                    continue
+                movie = radarr_by_tmdb.get(tmdb_id)
+                if not movie:
+                    continue
+
+                is_active = request["timestamp"] >= cutoff
+                if is_active and not movie.get("monitored", False):
+                    await self._set_radarr_movie_monitored(movie["id"], True)
+                    summary["movie_reenabled"] += 1
+                elif not is_active and movie.get("monitored", False):
+                    await self._set_radarr_movie_monitored(movie["id"], False)
+                    summary["movie_unmonitored"] += 1
+        except Exception as e:
+            logger.error(f"Error enforcing Radarr request monitoring cleanup: {e}", exc_info=True)
+
+        summary["media_tracking_pruned"] = self._prune_media_tracking_cache(latest_requests, cutoff)
+        summary["new_media_tracking_pruned"] = self._prune_new_media_tracking_cache(latest_requests, cutoff)
+        return summary
+
+    @tasks.loop(hours=24)
+    async def daily_cleanup_check(self):
+        """Check for media to clean up daily"""
+        # Ensure data is loaded
+        await self.load_data()
+
+        if not self.config["enabled"]:
+            logger.info("Media cleanup is disabled")
+            return
+
+        if not self.services.plex_server:
+            logger.warning("Plex server not available for cleanup check")
+            return
+
+        try:
+            logger.info("Starting daily media cleanup check...")
+            monitor_summary = await self.enforce_request_monitor_cleanup()
+            logger.info(f"Request monitor cleanup summary: {monitor_summary}")
+
+            items_to_notify = []
+            items_to_delete = []
+
+            # Get all libraries
+            for library in self.services.plex_server.library.sections():
+                # Skip excluded libraries
+                if library.title in self.config["exclude_libraries"]:
+                    logger.info(f"Skipping excluded library: {library.title}")
+                    continue
+
+                # Only process movie and show libraries
+                if library.type not in ["movie", "show"]:
+                    continue
+
+                logger.info(f"Checking library: {library.title}")
+
+                # Get all items in library
+                for item in library.all():
+                    result = await self.check_item_for_cleanup(item)
+                    if result:
+                        if result["action"] == "notify":
+                            items_to_notify.append(result)
+                        elif result["action"] == "delete":
+                            items_to_delete.append(result)
+
+            # Send notifications
+            if items_to_notify:
+                await self.send_cleanup_notification(items_to_notify, "warning")
+
+            # Delete items
+            if items_to_delete:
+                deleted = await self.delete_media_items(items_to_delete)
+                if deleted:
+                    await self.send_cleanup_notification(deleted, "deleted")
+
+            logger.info(f"Cleanup check complete. Notified: {len(items_to_notify)}, Deleted: {len(items_to_delete)}")
+
+        except Exception as e:
+            logger.error(f"Error in daily cleanup check: {e}", exc_info=True)
+
+    @daily_cleanup_check.before_loop
+    async def before_daily_cleanup_check(self):
+        """Wait for bot to be ready before starting cleanup checks"""
+        await self.bot.wait_until_ready()
+
+    def _get_tmdb_id_from_guid(self, guid: str) -> Optional[int]:
+        """Extract a TMDB ID from a Plex guid string when available."""
+        if not guid or "tmdb://" not in guid:
+            return None
+
+        try:
+            tmdb_part = guid.split("tmdb://", 1)[1]
+            tmdb_part = tmdb_part.split("?", 1)[0]
+            tmdb_part = tmdb_part.split("/", 1)[0]
+            return int(tmdb_part)
+        except (IndexError, ValueError, TypeError):
+            return None
+
+    def _get_item_tmdb_id(self, item) -> Optional[int]:
+        """Best-effort TMDB extraction from Plex item guid metadata."""
+        guid_candidates = []
+
+        primary_guid = getattr(item, "guid", None)
+        if primary_guid:
+            guid_candidates.append(str(primary_guid))
+
+        for guid_obj in getattr(item, "guids", []) or []:
+            guid_value = getattr(guid_obj, "id", None) or getattr(guid_obj, "tag", None)
+            if guid_value:
+                guid_candidates.append(str(guid_value))
+            else:
+                guid_candidates.append(str(guid_obj))
+
+        for guid in guid_candidates:
+            tmdb_id = self._get_tmdb_id_from_guid(guid)
+            if tmdb_id:
+                return tmdb_id
+
+        return None
+
+    def _parse_request_timestamp(self, value: Optional[str]) -> Optional[datetime]:
+        if not value:
+            return None
+
+        try:
+            parsed = datetime.fromisoformat(value)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed
+        except ValueError:
+            logger.debug(f"Could not parse media request timestamp: {value}")
+            return None
+
+    def _get_recent_request_timestamp(self, item) -> Optional[datetime]:
+        """Return the newest request timestamp matching this Plex item, if any."""
+        try:
+            from core.media_tracking import get_media_tracker
+
+            tracker = get_media_tracker()
+            if not tracker or not getattr(tracker, "tracked_media", None):
+                return None
+
+            item_tmdb_id = self._get_item_tmdb_id(item)
+            item_title = getattr(item, "title", None)
+            item_media_type = "tv" if getattr(item, "type", None) == "show" else getattr(item, "type", None)
+            candidates = []
+
+            for tracked in tracker.tracked_media.values():
+                matches_tmdb = item_tmdb_id is not None and tracked.tmdb_id == item_tmdb_id
+                matches_title = item_tmdb_id is None and tracked.title == item_title and tracked.media_type == item_media_type
+                if not (matches_tmdb or matches_title):
+                    continue
+
+                request_ts = self._parse_request_timestamp(getattr(tracked, "request_timestamp", None))
+                if request_ts:
+                    candidates.append(request_ts)
+
+            if not candidates:
+                return None
+
+            return max(candidates)
+        except Exception as e:
+            logger.debug(f"Could not look up recent media request timestamp for {getattr(item, 'title', '<unknown>')}: {e}")
+            return None
+
+    async def check_item_for_cleanup(self, item) -> Optional[Dict]:
+        """Check if an item should be cleaned up"""
+        try:
+            # Get the item's rating key for tracking
+            rating_key = str(item.ratingKey)
+
+            exempt_items = self.config.get("exempt_items", {})
+            if rating_key in exempt_items:
+                logger.info(f"Skipping exempt media item: {item.title} ({item.type})")
+                return None
+
+            # Check last viewed time
+            last_viewed = None
+
+            # For TV shows, check all episodes
+            if item.type == "show":
+                # Get all episodes
+                episodes = []
+                for season in item.seasons():
+                    episodes.extend(season.episodes())
+
+                # Find the most recent view
+                for episode in episodes:
+                    if episode.lastViewedAt:
+                        if not last_viewed or episode.lastViewedAt > last_viewed:
+                            last_viewed = episode.lastViewedAt
+
+            # For movies, check directly
+            elif item.type == "movie":
+                last_viewed = item.lastViewedAt
+
+            # If never watched, use added date
+            if not last_viewed:
+                last_viewed = item.addedAt
+
+            if last_viewed and last_viewed.tzinfo is None:
+                last_viewed = last_viewed.replace(tzinfo=timezone.utc)
+
+            recent_request_timestamp = self._get_recent_request_timestamp(item)
+            if recent_request_timestamp and (not last_viewed or recent_request_timestamp > last_viewed):
+                logger.info(
+                    f"Using recent request timestamp for cleanup grace on {item.title}: "
+                    f"{recent_request_timestamp.isoformat()}"
+                )
+                last_viewed = recent_request_timestamp
+
+            # Calculate days since last activity
+            now = datetime.now(timezone.utc)
+            days_inactive = (now - last_viewed).days
+
+            # Determine action
+            inactivity_threshold = self.config["inactivity_days"]
+            notify_threshold = inactivity_threshold - self.config["notify_days_before"]
+
+            if days_inactive >= inactivity_threshold:
+                # Mark for deletion
+                return {
+                    "action": "delete",
+                    "item": item,
+                    "rating_key": rating_key,
+                    "title": item.title,
+                    "type": item.type,
+                    "last_viewed": last_viewed.isoformat(),
+                    "days_inactive": days_inactive,
+                }
+            elif days_inactive >= notify_threshold:
+                # Notify that it will be deleted soon
+                days_until_deletion = inactivity_threshold - days_inactive
+                return {
+                    "action": "notify",
+                    "item": item,
+                    "rating_key": rating_key,
+                    "title": item.title,
+                    "type": item.type,
+                    "last_viewed": last_viewed.isoformat(),
+                    "days_inactive": days_inactive,
+                    "days_until_deletion": days_until_deletion,
+                }
+
+            return None
+
+        except Exception as e:
+            logger.error(f"Error checking item {item.title}: {e}")
+            return None
+
+    async def delete_media_items(self, items: List[Dict]) -> List[Dict]:
+        """Delete media items from Sonarr/Radarr and Plex"""
+        deleted = []
+
+        for item_data in items:
+            try:
+                item = item_data["item"]
+                media_type = item_data["type"]
+
+                if self.config["dry_run"]:
+                    logger.info(f"[DRY RUN] Would delete: {item.title} ({media_type})")
+                    deleted.append(item_data)
+                else:
+                    logger.info(f"Deleting: {item.title} ({media_type})")
+
+                    # Delete from Sonarr/Radarr first (this deletes the actual files)
+                    if media_type == "movie":
+                        success = await self._delete_from_radarr(item)
+                        if success:
+                            logger.info(f"Successfully deleted {item.title} from Radarr")
+                        else:
+                            logger.warning(f"Could not delete {item.title} from Radarr, trying Plex...")
+                    elif media_type == "show":
+                        success = await self._delete_from_sonarr(item)
+                        if success:
+                            logger.info(f"Successfully deleted {item.title} from Sonarr")
+                        else:
+                            logger.warning(f"Could not delete {item.title} from Sonarr, trying Plex...")
+
+                    # Also remove from Plex library (Sonarr/Radarr deletion should trigger this, but be safe)
+                    try:
+                        item.delete()
+                    except Exception as e:
+                        logger.debug(f"Could not delete from Plex (may already be gone): {e}")
+
+                    deleted.append(item_data)
+
+                    # Update tracking
+                    self.tracking_data[item_data["rating_key"]] = {
+                        "deleted_at": datetime.now(timezone.utc).isoformat(),
+                        "title": item.title,
+                        "type": item.type,
+                    }
+
+            except Exception as e:
+                logger.error(f"Error deleting {item_data['title']}: {e}")
+
+        await self.save_tracking_data()
+        return deleted
+
+    async def _delete_from_radarr(self, movie) -> bool:
+        """Delete a movie from Radarr (and disk)"""
+        try:
+            if not self.services.config.radarr_url or not self.services.config.radarr_token:
+                logger.warning("Radarr not configured")
+                return False
+
+            # Search for the movie in Radarr by title
+            search_url = f"{self.services.config.radarr_url}/api/v3/movie"
+            headers = {"X-Api-Key": self.services.config.radarr_token}
+
+            # Get all movies from Radarr
+            async with await self.services.api.radarr.get(search_url, headers=headers) as resp:
+                    if resp.status != 200:
+                        logger.error(f"Radarr API error: {resp.status}")
+                        return False
+
+                    movies = await resp.json()
+
+                    # Find matching movie (by title and year if available)
+                    movie_year = getattr(movie, 'year', None)
+                    radarr_movie = None
+
+                    for m in movies:
+                        title_match = m.get('title', '').lower() == movie.title.lower()
+                        year_match = True
+                        if movie_year and m.get('year'):
+                            year_match = m['year'] == movie_year
+
+                        if title_match and year_match:
+                            radarr_movie = m
+                            break
+
+                    if not radarr_movie:
+                        logger.warning(f"Could not find {movie.title} in Radarr")
+                        return False
+
+                    # Delete the movie (deleteFiles=true removes from disk)
+                    movie_id = radarr_movie['id']
+                    delete_url = f"{search_url}/{movie_id}?deleteFiles=true&addImportExclusion=false"
+
+                    async with await self.services.api.radarr.delete(delete_url, headers=headers) as resp:
+                        if resp.status in [200, 204]:
+                            logger.info(f"Deleted {movie.title} from Radarr and disk")
+                            return True
+                        else:
+                            logger.error(f"Failed to delete from Radarr: {resp.status}")
+                            return False
+
+        except Exception as e:
+            logger.error(f"Error deleting from Radarr: {e}")
+            return False
+
+    async def _delete_from_sonarr(self, show) -> bool:
+        """Delete a TV show from Sonarr (and disk)"""
+        try:
+            if not self.services.config.sonarr_url or not self.services.config.sonarr_token:
+                logger.warning("Sonarr not configured")
+                return False
+
+            # Search for the show in Sonarr by title
+            search_url = f"{self.services.config.sonarr_url}/api/v3/series"
+            headers = {"X-Api-Key": self.services.config.sonarr_token}
+
+            # Get all series from Sonarr
+            async with await self.services.api.sonarr.get(search_url, headers=headers) as resp:
+                    if resp.status != 200:
+                        logger.error(f"Sonarr API error: {resp.status}")
+                        return False
+
+                    series = await resp.json()
+
+                    # Find matching series (by title)
+                    show_year = getattr(show, 'year', None)
+                    sonarr_show = None
+
+                    for s in series:
+                        title_match = s.get('title', '').lower() == show.title.lower()
+                        year_match = True
+                        if show_year and s.get('year'):
+                            year_match = s['year'] == show_year
+
+                        if title_match and year_match:
+                            sonarr_show = s
+                            break
+
+                    if not sonarr_show:
+                        logger.warning(f"Could not find {show.title} in Sonarr")
+                        return False
+
+                    # Delete the series (deleteFiles=true removes from disk)
+                    series_id = sonarr_show['id']
+                    delete_url = f"{search_url}/{series_id}?deleteFiles=true&addImportListExclusion=false"
+
+                    async with await self.services.api.sonarr.delete(delete_url, headers=headers) as resp:
+                        if resp.status in [200, 204]:
+                            logger.info(f"Deleted {show.title} from Sonarr and disk")
+                            return True
+                        else:
+                            logger.error(f"Failed to delete from Sonarr: {resp.status}")
+                            return False
+
+        except Exception as e:
+            logger.error(f"Error deleting from Sonarr: {e}")
+            return False
+
+    async def send_cleanup_notification(self, items: List[Dict], notification_type: str):
+        """Send notification about cleanup actions"""
+        channel_id = self.config.get("notification_channel_id")
+        if not channel_id:
+            logger.warning("No notification channel configured for media cleanup")
+            return
+
+        channel = self.bot.get_channel(channel_id)
+        if not channel:
+            logger.error(f"Could not find notification channel {channel_id}")
+            return
+
+        try:
+            if notification_type == "warning":
+                embed = discord.Embed(
+                    title="⚠️ Media Cleanup Warning",
+                    description=f"The following {len(items)} item(s) will be removed soon due to inactivity:",
+                    color=discord.Color.orange(),
+                )
+
+                for item in items[:10]:  # Show max 10
+                    days = item["days_until_deletion"]
+                    embed.add_field(
+                        name=f"{'🎬' if item['type'] == 'movie' else '📺'} {item['title']}",
+                        value=f"Will be removed in **{days} day(s)** if not watched",
+                        inline=False
+                    )
+
+                if len(items) > 10:
+                    embed.add_field(
+                        name="And more...",
+                        value=f"+ {len(items) - 10} more items",
+                        inline=False
+                    )
+
+            elif notification_type == "deleted":
+                dry_run_text = " (DRY RUN)" if self.config["dry_run"] else ""
+                embed = discord.Embed(
+                    title=f"🗑️ Media Cleanup Complete{dry_run_text}",
+                    description=f"Removed {len(items)} item(s) due to {self.config['inactivity_days']} days of inactivity:",
+                    color=discord.Color.red() if not self.config["dry_run"] else discord.Color.blue(),
+                )
+
+                for item in items[:10]:  # Show max 10
+                    embed.add_field(
+                        name=f"{'🎬' if item['type'] == 'movie' else '📺'} {item['title']}",
+                        value=f"Inactive for {item['days_inactive']} days",
+                        inline=False
+                    )
+
+                if len(items) > 10:
+                    embed.add_field(
+                        name="And more...",
+                        value=f"+ {len(items) - 10} more items",
+                        inline=False
+                    )
+
+            embed.set_footer(text=f"Use /cleanup-config to adjust settings")
+            await channel.send(embed=embed)
+
+        except Exception as e:
+            logger.error(f"Error sending cleanup notification: {e}")
+
+    def _format_media_label(self, item_type: str, title: str, year: Optional[int] = None) -> str:
+        """Format a human-friendly media label"""
+        prefix = "[Movie]" if item_type == "movie" else "[Show]"
+        if year:
+            return f"{prefix} {title} ({year})"
+        return f"{prefix} {title}"
+
+    async def _find_media_matches(self, title_query: str, media_type: Optional[str] = None) -> List[Dict]:
+        """Find candidate Plex media items matching a title query"""
+        matches = []
+        normalized_query = title_query.casefold().strip()
+
+        for library in self.services.plex_server.library.sections():
+            if library.type not in ["movie", "show"]:
+                continue
+            if media_type and library.type != media_type:
+                continue
+
+            try:
+                candidates = library.search(title=title_query)
+            except Exception as e:
+                logger.error(f"Error searching {library.title} for '{title_query}': {e}")
+                continue
+
+            for item in candidates:
+                if item.type not in ["movie", "show"]:
+                    continue
+
+                item_title = getattr(item, "title", "")
+                item_year = getattr(item, "year", None)
+                exact = item_title.casefold() == normalized_query
+                contains = normalized_query in item_title.casefold()
+                score = 0 if exact else 1 if contains else 2
+
+                matches.append({
+                    "rating_key": str(item.ratingKey),
+                    "title": item_title,
+                    "type": item.type,
+                    "year": item_year,
+                    "added_at": item.addedAt.isoformat() if getattr(item, "addedAt", None) else None,
+                    "score": score,
+                })
+
+        deduped = {}
+        for match in matches:
+            deduped[match["rating_key"]] = match
+
+        return sorted(
+            deduped.values(),
+            key=lambda item: (item["score"], item["title"].casefold(), item.get("year") or 0, item["rating_key"]),
+        )
+
+    async def _resolve_single_media_match(self, title_query: str, media_type: Optional[str] = None) -> tuple[Optional[Dict], List[Dict]]:
+        """Resolve a query to one media item, preferring exact title matches"""
+        matches = await self._find_media_matches(title_query, media_type)
+        if not matches:
+            return None, []
+
+        exact_matches = [m for m in matches if m["title"].casefold() == title_query.casefold().strip()]
+        if len(exact_matches) == 1:
+            return exact_matches[0], matches
+        if len(matches) == 1:
+            return matches[0], matches
+        return None, matches
+
+    async def run_cleanup_scan(self, interaction: discord.Interaction):
+        """Run the actual cleanup scan logic"""
+        # Ensure data is loaded
+        await self.load_data()
+
+        if not self.services.plex_server:
+            await interaction.followup.send(
+                "❌ Plex server not available",
+                ephemeral=True
+            )
+            return
+
+        monitor_summary = await self.enforce_request_monitor_cleanup()
+        items_to_notify = []
+        items_to_delete = []
+
+        # Get all libraries
+        for library in self.services.plex_server.library.sections():
+            # Skip excluded libraries
+            if library.title in self.config["exclude_libraries"]:
+                logger.info(f"Skipping excluded library: {library.title}")
+                continue
+
+            # Only process movie and show libraries
+            if library.type not in ["movie", "show"]:
+                continue
+
+            logger.info(f"Checking library: {library.title}")
+
+            # Get all items in library
+            for item in library.all():
+                result = await self.check_item_for_cleanup(item)
+                if result:
+                    if result["action"] == "notify":
+                        items_to_notify.append(result)
+                    elif result["action"] == "delete":
+                        items_to_delete.append(result)
+
+        # Send notifications
+        if items_to_notify:
+            await self.send_cleanup_notification(items_to_notify, "warning")
+
+        # Delete items
+        deleted_items = []
+        if items_to_delete:
+            deleted_items = await self.delete_media_items(items_to_delete)
+            if deleted_items:
+                await self.send_cleanup_notification(deleted_items, "deleted")
+
+        # Send summary to user
+        summary_embed = discord.Embed(
+            title="✅ Cleanup Scan Complete",
+            color=discord.Color.green()
+        )
+
+        summary_embed.add_field(
+            name="⚠️ Items Needing Attention",
+            value=f"{len(items_to_notify)} item(s) will be deleted soon",
+            inline=True
+        )
+
+        action_text = "Would be deleted" if self.config["dry_run"] else "Deleted"
+        summary_embed.add_field(
+            name=f"🗑️ Items {action_text}",
+            value=f"{len(deleted_items)} item(s)",
+            inline=True
+        )
+
+        summary_embed.add_field(
+            name="🛠️ Request Monitor Sync",
+            value=(
+                f"TV off: {monitor_summary['tv_unmonitored']} | TV on: {monitor_summary['tv_reenabled']}\n"
+                f"Movies off: {monitor_summary['movie_unmonitored']} | Movies on: {monitor_summary['movie_reenabled']}\n"
+                f"Tracking pruned: {monitor_summary['media_tracking_pruned']} + {monitor_summary['new_media_tracking_pruned']}"
+            ),
+            inline=False
+        )
+
+        if items_to_delete and self.config["dry_run"]:
+            summary_embed.set_footer(text="Dry run mode - no files were actually deleted.")
+
+        await interaction.followup.send(embed=summary_embed, ephemeral=True)
+        logger.info(f"Cleanup scan complete. Notified: {len(items_to_notify)}, Deleted: {len(deleted_items)}")
+
+    @app_commands.command(name="cleanup-exempt-add", description="Exempt a movie or show from automatic cleanup")
+    @app_commands.describe(
+        title="Movie or show title to exempt",
+        media_type="Limit the search to movies or shows"
+    )
+    @app_commands.choices(media_type=[
+        app_commands.Choice(name="Movie", value="movie"),
+        app_commands.Choice(name="Show", value="show"),
+    ])
+    async def cleanup_exempt_add(
+        self,
+        interaction: discord.Interaction,
+        title: str,
+        media_type: Optional[app_commands.Choice[str]] = None,
+    ):
+        """Add a specific media item to the cleanup exemption list"""
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message(
+                "You don't have permission to use this command.",
+                ephemeral=True
+            )
+            return
+
+        await self.load_data()
+
+        if not self.services.plex_server:
+            await interaction.response.send_message(
+                "Plex server not available",
+                ephemeral=True
+            )
+            return
+
+        selected_type = media_type.value if media_type else None
+        match, matches = await self._resolve_single_media_match(title, selected_type)
+        if not match:
+            if not matches:
+                await interaction.response.send_message(
+                    f"No matching media found for `{title}`.",
+                    ephemeral=True
+                )
+                return
+
+            preview = "\n".join(
+                f"- {self._format_media_label(item['type'], item['title'], item.get('year'))}"
+                for item in matches[:10]
+            )
+            await interaction.response.send_message(
+                f"Found multiple matches for `{title}`. Please refine the title or specify the media type.\n\n{preview}",
+                ephemeral=True
+            )
+            return
+
+        exempt_items = self.config.setdefault("exempt_items", {})
+        exempt_items[match["rating_key"]] = {
+            "title": match["title"],
+            "type": match["type"],
+            "year": match.get("year"),
+            "added_at": match.get("added_at"),
+            "exempted_at": datetime.now(timezone.utc).isoformat(),
+        }
+        await self.save_config()
+
+        embed = create_info_embed(
+            "Configuration Updated",
+            f"Exempted: {self._format_media_label(match['type'], match['title'], match.get('year'))}\n\nThis item will be skipped by automatic cleanup until you remove the exemption."
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        logger.info(f"{interaction.user} exempted media from cleanup: {match['title']} ({match['type']}) [{match['rating_key']}]")
+
+    @app_commands.command(name="cleanup-exempt-remove", description="Remove a cleanup exemption from a movie or show")
+    @app_commands.describe(title="Movie or show title to remove from the exemption list")
+    async def cleanup_exempt_remove(self, interaction: discord.Interaction, title: str):
+        """Remove a specific media item from the cleanup exemption list"""
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message(
+                "You don't have permission to use this command.",
+                ephemeral=True
+            )
+            return
+
+        await self.load_data()
+        exempt_items = self.config.setdefault("exempt_items", {})
+        query = title.casefold().strip()
+        matches = [
+            (rating_key, data)
+            for rating_key, data in exempt_items.items()
+            if query in data.get("title", "").casefold()
+        ]
+
+        if not matches:
+            await interaction.response.send_message(
+                f"No exempt media found matching `{title}`.",
+                ephemeral=True
+            )
+            return
+
+        exact_matches = [
+            (rating_key, data)
+            for rating_key, data in matches
+            if data.get("title", "").casefold() == query
+        ]
+        if len(exact_matches) == 1:
+            matches = exact_matches
+
+        if len(matches) > 1:
+            preview = "\n".join(
+                f"- {self._format_media_label(data.get('type', 'show'), data.get('title', 'Unknown'), data.get('year'))}"
+                for _, data in matches[:10]
+            )
+            await interaction.response.send_message(
+                f"Multiple exempt items matched `{title}`. Please use a more specific title.\n\n{preview}",
+                ephemeral=True
+            )
+            return
+
+        rating_key, data = matches[0]
+        exempt_items.pop(rating_key, None)
+        await self.save_config()
+
+        embed = create_info_embed(
+            "Configuration Updated",
+            f"Removed exemption: {self._format_media_label(data.get('type', 'show'), data.get('title', 'Unknown'), data.get('year'))}\n\nThis item will be evaluated by automatic cleanup again."
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        logger.info(f"{interaction.user} removed cleanup exemption: {data.get('title', 'Unknown')} ({data.get('type', 'unknown')}) [{rating_key}]")
+
+    @app_commands.command(name="cleanup-exempt-list", description="List media currently exempt from automatic cleanup")
+    async def cleanup_exempt_list(self, interaction: discord.Interaction):
+        """List the current cleanup exemption entries"""
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message(
+                "You don't have permission to use this command.",
+                ephemeral=True
+            )
+            return
+
+        await self.load_data()
+        exempt_items = self.config.get("exempt_items", {})
+
+        if not exempt_items:
+            embed = create_info_embed(
+                "No Exempt Media",
+                "No specific movies or shows are currently exempt from automatic cleanup."
+            )
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+            return
+
+        entries = sorted(
+            exempt_items.values(),
+            key=lambda item: (item.get("type", ""), item.get("title", "").casefold(), item.get("year") or 0),
+        )
+
+        embed = discord.Embed(
+            title="Cleanup Exemptions",
+            description=f"{len(entries)} item(s) are exempt from automatic cleanup.",
+            color=discord.Color.green(),
+        )
+
+        lines = [
+            f"- {self._format_media_label(item.get('type', 'show'), item.get('title', 'Unknown'), item.get('year'))}"
+            for item in entries[:20]
+        ]
+        embed.add_field(name="Exempt Media", value="\n".join(lines), inline=False)
+        if len(entries) > 20:
+            embed.set_footer(text=f"Showing first 20 of {len(entries)} exempt items")
+
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @app_commands.command(name="cleanup", description="Media cleanup control panel (Admin only)")
+    async def cleanup_panel(self, interaction: discord.Interaction):
+        """Show the interactive cleanup control panel"""
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message(
+                "You don't have permission to use this command.",
+                ephemeral=True
+            )
+            return
+
+        # Ensure data is loaded
+        await self.load_data()
+
+        # Create control panel
+        view = CleanupControlPanel(self)
+
+        status = "✅ Enabled" if self.config["enabled"] else "❌ Disabled"
+        mode = "🔵 Dry Run" if self.config["dry_run"] else "🔴 Live Mode"
+
+        embed = discord.Embed(
+            title="🗑️ Media Cleanup Control Panel",
+            description="Manage automatic cleanup of unwatched media",
+            color=discord.Color.blue() if self.config["dry_run"] else discord.Color.red()
+        )
+
+        embed.add_field(name="Status", value=status, inline=True)
+        embed.add_field(name="Mode", value=mode, inline=True)
+        embed.add_field(
+            name="Inactivity Threshold",
+            value=f"{self.config['inactivity_days']} days",
+            inline=True
+        )
+
+        embed.set_footer(text="Use the buttons below to control cleanup")
+
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+    @app_commands.command(name="cleanup-config", description="Configure cleanup settings (Admin only)")
+    @app_commands.describe(
+        inactivity_days="Number of days before media is considered inactive",
+        notification_channel="Channel to send cleanup notifications"
+    )
+    async def cleanup_config(
+        self,
+        interaction: discord.Interaction,
+        inactivity_days: Optional[int] = None,
+        notification_channel: Optional[discord.TextChannel] = None
+    ):
+        """Configure cleanup settings (for advanced options)"""
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message(
+                "You don't have permission to use this command.",
+                ephemeral=True
+            )
+            return
+
+        changes = []
+
+        if inactivity_days is not None:
+            if inactivity_days < 30:
+                await interaction.response.send_message(
+                    "Inactivity days must be at least 30 days for safety.",
+                    ephemeral=True
+                )
+                return
+            self.config["inactivity_days"] = inactivity_days
+            changes.append(f"Inactivity Days: {inactivity_days}")
+
+        if notification_channel is not None:
+            self.config["notification_channel_id"] = notification_channel.id
+            changes.append(f"Notification Channel: {notification_channel.mention}")
+
+        if changes:
+            await self.save_config()
+            embed = create_info_embed(
+                "✅ Configuration Updated",
+                "\n".join(f"• {change}" for change in changes)
+            )
+        else:
+            embed = create_info_embed(
+                "ℹ️ No Changes Made",
+                "Use the command parameters to update settings, or use `/cleanup` for the interactive panel."
+            )
+
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        logger.info(f"{interaction.user} updated cleanup config: {changes}")
+
+
+async def setup(bot: commands.Bot):
+    """Setup function for loading cog"""
+    pass

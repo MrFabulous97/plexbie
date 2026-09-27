@@ -1,0 +1,725 @@
+# path: plugins/new_media_added/cog.py
+"""New media added notifications from Plex webhooks"""
+import asyncio
+import json
+from datetime import datetime, timezone, timedelta
+from typing import Optional, Dict, Any, List
+from collections import defaultdict
+
+import discord
+from discord.ext import commands, tasks
+
+from core.logging import get_logger
+from core.services import BotServices
+from database.kv_store import kv_get, kv_set, kv_get_all
+
+logger = get_logger(__name__)
+
+# Namespace for tracking episode batches and messages
+NEW_MEDIA_NAMESPACE = "new_media_tracking"
+# BATCH_WINDOW_SECONDS now from config (media_batch_window)
+
+
+class EpisodeBatch:
+    """Track a batch of episodes being added for a show/season"""
+
+    def __init__(self, show_title: str, season: int, tmdb_id: Optional[int] = None):
+        self.show_title = show_title
+        self.season = season
+        self.tmdb_id = tmdb_id
+        self.episodes: List[int] = []
+        self.message_id: Optional[int] = None
+        self.channel_id: Optional[int] = None
+        self.last_update = datetime.now(timezone.utc)
+        self.is_monitored = False
+        self.expected_episode_count: Optional[int] = None
+
+    def add_episode(self, episode_num: int):
+        """Add an episode to the batch"""
+        if episode_num not in self.episodes:
+            self.episodes.append(episode_num)
+            self.episodes.sort()
+            self.last_update = datetime.now(timezone.utc)
+
+    def is_recent(self, seconds: int = 30) -> bool:
+        """Check if this batch is still within the grouping window"""
+        return (datetime.now(timezone.utc) - self.last_update).total_seconds() < seconds
+
+    def should_create_new_message(self) -> bool:
+        """Determine if we should create a new message instead of editing"""
+        # If we have a monitored show and we've reached the expected count, start fresh
+        if self.is_monitored and self.expected_episode_count:
+            return len(self.episodes) >= self.expected_episode_count
+
+        # If batch is old, start fresh
+        return not self.is_recent(seconds=300)  # 5 minute window
+
+    def to_dict(self) -> Dict:
+        """Serialize to dict"""
+        return {
+            "show_title": self.show_title,
+            "season": self.season,
+            "tmdb_id": self.tmdb_id,
+            "episodes": self.episodes,
+            "message_id": self.message_id,
+            "channel_id": self.channel_id,
+            "last_update": self.last_update.isoformat(),
+            "is_monitored": self.is_monitored,
+            "expected_episode_count": self.expected_episode_count,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict) -> "EpisodeBatch":
+        """Deserialize from dict"""
+        batch = cls(data["show_title"], data["season"], data.get("tmdb_id"))
+        batch.episodes = data["episodes"]
+        batch.message_id = data.get("message_id")
+        batch.channel_id = data.get("channel_id")
+        batch.last_update = datetime.fromisoformat(data["last_update"])
+        batch.is_monitored = data.get("is_monitored", False)
+        batch.expected_episode_count = data.get("expected_episode_count")
+        return batch
+
+
+class NewMediaAddedCog(commands.Cog):
+    """Handle new media webhooks from Plex"""
+
+    def __init__(self, bot: commands.Bot, services: BotServices):
+        self.bot = bot
+        self.services = services
+        self.active_batches: Dict[str, EpisodeBatch] = {}
+        self._data_loaded = False
+        self.cleanup_old_batches.start()
+
+    async def register_webhook_routes(self, webhook_server):
+        """Register Plex webhook route before server starts"""
+        from aiohttp import web
+
+        async def handle_plex_webhook(request):
+            try:
+                # Plex sends multipart/form-data
+                data = await request.post()
+                payload_json = data.get("payload")
+
+                if payload_json:
+                    payload = json.loads(payload_json)
+                    await self.handle_plex_webhook(payload)
+
+                return web.json_response({"status": "ok"})
+            except Exception as e:
+                logger.error(f"Plex webhook error: {e}")
+                return web.json_response({"error": str(e)}, status=400)
+
+        webhook_server.app.router.add_post("/webhook/plex", handle_plex_webhook)
+        logger.info("✅ Registered Plex webhook handler at /webhook/plex")
+
+    def cog_unload(self):
+        """Cleanup when cog is unloaded"""
+        self.cleanup_old_batches.cancel()
+        # Note: Can't await in cog_unload, data will be saved on next cleanup cycle
+
+    async def load_tracking_data(self):
+        """Load tracking data from database"""
+        if self._data_loaded:
+            return
+        try:
+            data = await kv_get_all(NEW_MEDIA_NAMESPACE)
+            for key, batch_data in data.items():
+                self.active_batches[key] = EpisodeBatch.from_dict(batch_data)
+            self._data_loaded = True
+            logger.info(f"Loaded {len(self.active_batches)} active batches")
+        except Exception as e:
+            logger.error(f"Error loading tracking data: {e}")
+
+    async def save_tracking_data(self):
+        """Save tracking data to database"""
+        try:
+            for key, batch in self.active_batches.items():
+                await kv_set(NEW_MEDIA_NAMESPACE, key, batch.to_dict())
+        except Exception as e:
+            logger.error(f"Error saving tracking data: {e}")
+
+    @tasks.loop(minutes=5)
+    async def cleanup_old_batches(self):
+        """Remove old batches that are no longer active"""
+        # Ensure data is loaded
+        await self.load_tracking_data()
+
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
+        to_remove = []
+
+        for key, batch in self.active_batches.items():
+            if batch.last_update < cutoff and not batch.is_monitored:
+                to_remove.append(key)
+
+        for key in to_remove:
+            del self.active_batches[key]
+
+        if to_remove:
+            await self.save_tracking_data()
+            logger.info(f"Cleaned up {len(to_remove)} old batches")
+
+    def get_batch_key(self, show_title: str, season: int) -> str:
+        """Generate a unique key for a show/season batch"""
+        return f"{show_title.lower()}:s{season}"
+
+    async def _fetch_tmdb_data(
+        self, tmdb_id: int, media_type: str = "tv"
+    ) -> Optional[Dict]:
+        """Fetch TMDB data for media"""
+        if not self.services.config.tmdb_api_key:
+            logger.warning("TMDB API key not configured")
+            return None
+
+        try:
+            url = f"https://api.themoviedb.org/3/{media_type}/{tmdb_id}"
+            params = {"api_key": self.services.config.tmdb_api_key}
+
+            async with await self.services.api.tmdb.get(url, params=params) as response:
+                if response.status == 200:
+                    return await response.json()
+                else:
+                    logger.debug(f"TMDB API returned {response.status} for {tmdb_id}")
+                    return None
+
+        except Exception as e:
+            logger.error(f"Error fetching TMDB data: {e}")
+            return None
+
+    async def _fetch_tvdb_data(self, tvdb_id: int) -> Optional[Dict]:
+        """Fetch TheTVDB data (if we add TVDB API support later)"""
+        # Placeholder for TVDB API integration
+        # For now, we'll use TMDB which also has good TV show data
+        return None
+
+    def _get_tmdb_id_from_plex_guid(self, guid: str) -> Optional[int]:
+        """Extract TMDB ID from Plex GUID"""
+        try:
+            if "tmdb://" in guid:
+                return int(guid.split("tmdb://")[1])
+        except (ValueError, IndexError) as e:
+            logger.debug(f"Could not extract TMDB ID from {guid}: {e}")
+        return None
+
+    def _get_tvdb_id_from_plex_guid(self, guid: str) -> Optional[int]:
+        """Extract TVDB ID from Plex GUID"""
+        try:
+            if "tvdb://" in guid:
+                return int(guid.split("tvdb://")[1])
+        except (ValueError, IndexError) as e:
+            logger.debug(f"Could not extract TVDB ID from {guid}: {e}")
+        return None
+
+    async def _create_media_embed(
+        self,
+        title: str,
+        description: str,
+        overview: str,
+        poster_url: Optional[str],
+        tmdb_id: Optional[int],
+        tvdb_id: Optional[int],
+        plex_web_url: Optional[str],
+        media_type: str = "tv",
+    ) -> discord.Embed:
+        """Create a rich embed for new media"""
+
+        embed = discord.Embed(
+            title=title,
+            description=f"**{description}**\n\n{overview}",
+            color=discord.Color.blue(),
+            timestamp=datetime.now(timezone.utc),
+        )
+
+        # Add poster image
+        if poster_url:
+            embed.set_image(url=poster_url)
+
+        # Add links
+        links = []
+        if tvdb_id and media_type == "tv":
+            links.append(
+                f"[View Details on TheTVDB](https://thetvdb.com/?tab=series&id={tvdb_id})"
+            )
+        if plex_web_url:
+            links.append(f"[View Details on Plex Web]({plex_web_url})")
+
+        if links:
+            embed.add_field(name="Links", value="\n".join(links), inline=False)
+
+        return embed
+
+    def _format_episode_list(self, episodes: List[int]) -> str:
+        """Format a list of episodes nicely (e.g., '1-3, 5, 7-9')"""
+        if not episodes:
+            return ""
+
+        episodes = sorted(episodes)
+        ranges = []
+        start = episodes[0]
+        end = episodes[0]
+
+        for i in range(1, len(episodes)):
+            if episodes[i] == end + 1:
+                end = episodes[i]
+            else:
+                if start == end:
+                    ranges.append(f"{start}")
+                else:
+                    ranges.append(f"{start}-{end}")
+                start = end = episodes[i]
+
+        # Add last range
+        if start == end:
+            ranges.append(f"{start}")
+        else:
+            ranges.append(f"{start}-{end}")
+
+        return ", ".join(ranges)
+
+    async def handle_plex_webhook(self, payload: Dict[str, Any]):
+        """Process Plex webhook payload"""
+        try:
+            event = payload.get("event")
+
+            # We only care about library.new events
+            if event != "library.new":
+                return
+
+            metadata = payload.get("Metadata", {})
+            if not metadata:
+                return
+
+            media_type = metadata.get("type")
+
+            # Handle TV episodes specially for batching
+            if media_type == "episode":
+                await self._handle_new_episode(metadata, payload)
+            elif media_type in ["movie", "show"]:
+                await self._handle_new_media(metadata, payload, media_type)
+
+        except Exception as e:
+            logger.error(f"Error processing Plex webhook: {e}", exc_info=True)
+
+    async def _handle_new_episode(self, metadata: Dict, payload: Dict):
+        """Handle new TV episode with smart batching"""
+        # Ensure data is loaded
+        await self.load_tracking_data()
+        try:
+            # Extract episode info
+            show_title = metadata.get("grandparentTitle", "Unknown Show")
+            season = metadata.get("parentIndex", 0)
+            episode = metadata.get("index", 0)
+            episode_title = metadata.get("title", "Unknown Episode")
+
+            # Get GUIDs from BOTH episode and show level
+            # Episodes often have TVDB IDs, but the show GUIDs have TMDB IDs
+            guids = metadata.get("Guid", [])
+
+            # Also check grandparent (show) GUIDs if available
+            grandparent_guids = []
+            if "grandparentGuid" in metadata:
+                grandparent_guids.append({"id": metadata["grandparentGuid"]})
+
+            tmdb_id = None
+            tvdb_id = None
+
+            # First try episode GUIDs
+            for guid in guids:
+                guid_id = guid.get("id", "")
+                if not tmdb_id:
+                    tmdb_id = self._get_tmdb_id_from_plex_guid(guid_id)
+                if not tvdb_id:
+                    tvdb_id = self._get_tvdb_id_from_plex_guid(guid_id)
+
+            # Then try grandparent (show) GUIDs for TMDB ID
+            for guid in grandparent_guids:
+                guid_id = guid.get("id", "")
+                if not tmdb_id:
+                    tmdb_id = self._get_tmdb_id_from_plex_guid(guid_id)
+                if not tvdb_id:
+                    tvdb_id = self._get_tvdb_id_from_plex_guid(guid_id)
+
+            # Check if this is part of an active batch
+            batch_key = self.get_batch_key(show_title, season)
+            batch = self.active_batches.get(batch_key)
+
+            if not batch:
+                # Create new batch
+                batch = EpisodeBatch(show_title, season, tmdb_id)
+                self.active_batches[batch_key] = batch
+
+                # Check if this show/season is being monitored
+                # (Integration point with media_requests plugin)
+                batch.is_monitored = await self._check_if_monitored(
+                    show_title, season, tmdb_id
+                )
+
+            # Add episode to batch
+            batch.add_episode(episode)
+
+            # Check if this episode is part of a tracked request
+            tracked_media = None
+            if tmdb_id and batch.is_monitored:
+                try:
+                    from core.media_tracking import get_media_tracker
+                    tracker = get_media_tracker()
+                    tracked_media = tracker.mark_episode_available(
+                        tmdb_id, season, episode, episode_title
+                    )
+                except Exception as e:
+                    logger.error(f"Error updating tracked media: {e}")
+
+            should_publish_updates = True
+            if tracked_media:
+                should_publish_updates = tracked_media.should_notify_for_episode_arrival(season, episode)
+                if not should_publish_updates:
+                    logger.info(
+                        f"Skipping updates-channel episode post for tracked request {show_title} "
+                        f"S{season:02d}E{episode:02d}; waiting for first requested season premiere only"
+                    )
+
+            # Determine if we should post or edit
+            if should_publish_updates:
+                if not batch.message_id or batch.should_create_new_message():
+                    # Create new message
+                    await self._post_new_episode_message(
+                        batch, episode_title, tmdb_id, tvdb_id, payload
+                    )
+                else:
+                    # Edit existing message
+                    await self._edit_episode_message(
+                        batch, episode_title, tmdb_id, tvdb_id
+                    )
+
+            if tracked_media and tracked_media.should_notify_for_episode_arrival(season, episode):
+                await self._send_requester_availability_dm(
+                    tracked_media,
+                    media_kind="tv",
+                    detail=f"Season {season}, Episode 1",
+                )
+
+            await self.save_tracking_data()
+
+        except Exception as e:
+            logger.error(f"Error handling new episode: {e}", exc_info=True)
+
+    async def _post_new_episode_message(
+        self,
+        batch: EpisodeBatch,
+        episode_title: str,
+        tmdb_id: Optional[int],
+        tvdb_id: Optional[int],
+        payload: Dict,
+    ):
+        """Post a new message for episode(s)"""
+        # Get the updates channel
+        channel_id = self.services.config.updates_channel_id
+        if not channel_id:
+            logger.warning("Updates channel not configured")
+            return
+
+        channel = self.bot.get_channel(channel_id)
+        if not channel:
+            logger.error(f"Could not find channel {channel_id}")
+            return
+
+        # Fetch TMDB data for rich info
+        tmdb_data = None
+        if tmdb_id:
+            tmdb_data = await self._fetch_tmdb_data(tmdb_id, "tv")
+
+        # Build embed
+        title = f"📺 A new episode of {batch.show_title} has been acquired from across the infinite cosmos!"
+
+        episode_list = self._format_episode_list(batch.episodes)
+        if len(batch.episodes) == 1:
+            description = f"{batch.show_title} - S{batch.season:02d}E{batch.episodes[0]:02d}: {episode_title}"
+        else:
+            description = f"{batch.show_title} - Season {batch.season}, Episodes {episode_list}"
+
+        overview = "No description available."
+        poster_url = None
+
+        if tmdb_data:
+            overview = tmdb_data.get("overview", overview)
+            if tmdb_data.get("poster_path"):
+                poster_url = f"https://image.tmdb.org/t/p/w500{tmdb_data['poster_path']}"
+
+        # Get Plex web URL (if available)
+        plex_web_url = None
+        if "Server" in payload and "key" in payload.get("Metadata", {}):
+            machine_id = payload["Server"].get("uuid")
+            item_key = payload["Metadata"].get("key")
+            if machine_id and item_key:
+                plex_web_url = f"https://app.plex.tv/desktop/#!/server/{machine_id}/details?key={item_key}"
+
+        embed = await self._create_media_embed(
+            title, description, overview, poster_url, tmdb_id, tvdb_id, plex_web_url
+        )
+
+        # Send message
+        message = await channel.send(embed=embed)
+
+        # Update batch tracking
+        batch.message_id = message.id
+        batch.channel_id = channel.id
+
+        logger.info(
+            f"Posted new episode message for {batch.show_title} S{batch.season} - Episodes {episode_list}"
+        )
+
+    async def _edit_episode_message(
+        self,
+        batch: EpisodeBatch,
+        latest_episode_title: str,
+        tmdb_id: Optional[int],
+        tvdb_id: Optional[int],
+    ):
+        """Edit existing message to add new episodes"""
+        if not batch.message_id or not batch.channel_id:
+            logger.warning("No message to edit")
+            return
+
+        channel = self.bot.get_channel(batch.channel_id)
+        if not channel:
+            logger.error(f"Could not find channel {batch.channel_id}")
+            return
+
+        try:
+            message = await channel.fetch_message(batch.message_id)
+        except discord.NotFound:
+            logger.warning(f"Message {batch.message_id} not found, will create new one")
+            batch.message_id = None
+            return
+        except Exception as e:
+            logger.error(f"Error fetching message: {e}")
+            return
+
+        # Fetch TMDB data
+        tmdb_data = None
+        if tmdb_id:
+            tmdb_data = await self._fetch_tmdb_data(tmdb_id, "tv")
+
+        # Update embed
+        title = f"📺 A new episode of {batch.show_title} has been acquired from across the infinite cosmos!"
+
+        episode_list = self._format_episode_list(batch.episodes)
+        description = (
+            f"{batch.show_title} - Season {batch.season}, Episodes {episode_list}"
+        )
+
+        overview = "No description available."
+        poster_url = None
+
+        if tmdb_data:
+            overview = tmdb_data.get("overview", overview)
+            if tmdb_data.get("poster_path"):
+                poster_url = f"https://image.tmdb.org/t/p/w500{tmdb_data['poster_path']}"
+
+        # Keep existing plex web URL if present
+        plex_web_url = None
+        if message.embeds and message.embeds[0].fields:
+            for field in message.embeds[0].fields:
+                if "Plex Web" in field.value:
+                    # Extract URL from markdown
+                    import re
+
+                    match = re.search(r"\(https://[^\)]+\)", field.value)
+                    if match:
+                        plex_web_url = match.group(0)[1:-1]
+
+        embed = await self._create_media_embed(
+            title, description, overview, poster_url, tmdb_id, tvdb_id, plex_web_url
+        )
+
+        # Edit message
+        await message.edit(embed=embed)
+
+        logger.info(
+            f"Updated episode message for {batch.show_title} S{batch.season} - Episodes {episode_list}"
+        )
+
+    async def _handle_new_media(
+        self, metadata: Dict, payload: Dict, media_type: str
+    ):
+        """Handle new movie or show"""
+        try:
+            title = metadata.get("title", "Unknown")
+
+            # Get GUIDs
+            guids = metadata.get("Guid", [])
+            tmdb_id = None
+            tvdb_id = None
+
+            for guid in guids:
+                guid_id = guid.get("id", "")
+                if not tmdb_id:
+                    tmdb_id = self._get_tmdb_id_from_plex_guid(guid_id)
+                if not tvdb_id:
+                    tvdb_id = self._get_tvdb_id_from_plex_guid(guid_id)
+
+            # Fetch TMDB data
+            tmdb_data = None
+            if tmdb_id:
+                tmdb_data = await self._fetch_tmdb_data(tmdb_id, media_type)
+
+            # Build embed
+            icon = "🎬" if media_type == "movie" else "📺"
+            embed_title = f"{icon} {title} has been added!"
+
+            overview = metadata.get("summary", "No description available.")
+            poster_url = None
+
+            if tmdb_data:
+                overview = tmdb_data.get("overview", overview)
+                if tmdb_data.get("poster_path"):
+                    poster_url = (
+                        f"https://image.tmdb.org/t/p/w500{tmdb_data['poster_path']}"
+                    )
+
+            # Get Plex web URL
+            plex_web_url = None
+            if "Server" in payload and "key" in metadata:
+                machine_id = payload["Server"].get("uuid")
+                item_key = metadata.get("key")
+                if machine_id and item_key:
+                    plex_web_url = f"https://app.plex.tv/desktop/#!/server/{machine_id}/details?key={item_key}"
+
+            embed = await self._create_media_embed(
+                embed_title,
+                title,
+                overview,
+                poster_url,
+                tmdb_id,
+                tvdb_id,
+                plex_web_url,
+                media_type,
+            )
+
+            # Send to updates channel
+            channel_id = self.services.config.updates_channel_id
+            if not channel_id:
+                logger.warning("Updates channel not configured")
+                return
+
+            channel = self.bot.get_channel(channel_id)
+            if not channel:
+                logger.error(f"Could not find channel {channel_id}")
+                return
+
+            await channel.send(embed=embed)
+
+            logger.info(f"Posted new {media_type} notification for {title}")
+
+            if media_type == "movie" and tmdb_id:
+                from core.media_tracking import get_media_tracker
+
+                tracker = get_media_tracker()
+                tracked_media = tracker.get_tracked_media(tmdb_id)
+                if tracked_media and tracked_media.should_notify_for_movie_arrival():
+                    await self._send_requester_availability_dm(
+                        tracked_media,
+                        media_kind="movie",
+                    )
+
+        except Exception as e:
+            logger.error(f"Error handling new media: {e}", exc_info=True)
+
+    async def _check_if_monitored(
+        self, show_title: str, season: int, tmdb_id: Optional[int]
+    ) -> bool:
+        """Check if this show/season is being monitored (from media_requests)"""
+        try:
+            from core.media_tracking import get_media_tracker
+
+            tracker = get_media_tracker()
+
+            # Try to find by TMDB ID first (most reliable)
+            if tmdb_id:
+                tracked = tracker.get_tracked_media(tmdb_id, season)
+                if tracked:
+                    return True
+
+            # Fallback: try to match by title and season
+            tracker.load_tracking_data()
+            for tracked_media in tracker.tracked_media.values():
+                requested_seasons = tracked_media.requested_season_numbers() if hasattr(tracked_media, "requested_season_numbers") else None
+                season_matches = (
+                    tracked_media.season_number == season
+                    or tracked_media.season_number is None
+                    or requested_seasons is None
+                    or season in requested_seasons
+                )
+                if (
+                    tracked_media.media_type == "tv"
+                    and tracked_media.title.lower() == show_title.lower()
+                    and season_matches
+                ):
+                    return True
+
+            return False
+
+        except Exception as e:
+            logger.error(f"Error checking if monitored: {e}", exc_info=True)
+            return False
+
+    async def _get_receipt_channel(self):
+        """Return the admin-facing receipt channel, preferring admin then updates."""
+        for channel_id in [self.services.config.admin_channel_id, self.services.config.updates_channel_id]:
+            if not channel_id:
+                continue
+            channel = self.bot.get_channel(channel_id)
+            if channel:
+                return channel
+        return None
+
+    async def _send_receipt(self, message: str):
+        """Send an admin-facing receipt message for requester DM activity."""
+        channel = await self._get_receipt_channel()
+        if not channel:
+            logger.warning(f"No receipt channel available for requester DM receipt: {message}")
+            return
+
+        await channel.send(message)
+
+    async def _send_requester_availability_dm(self, tracked_media, media_kind: str, detail: Optional[str] = None):
+        """Send a friendly requester DM when media first becomes watchable on Plex."""
+        try:
+            if tracked_media.requester_notification_sent:
+                return
+
+            user = await self.bot.fetch_user(tracked_media.requester_user_id)
+
+            if media_kind == "movie":
+                dm_message = f"✅ **Good news!** The movie you requested, **{tracked_media.title}**, is now available on Plex."
+                reason = "movie_available"
+                receipt_detail = "movie available on Plex"
+            else:
+                dm_message = (
+                    f"✅ **Good news!** **{tracked_media.title}** is now ready to start on Plex — "
+                    f"**{detail or 'Episode 1'}** is available."
+                )
+                reason = "requested_season_episode_1_available"
+                receipt_detail = detail or "Episode 1 available"
+
+            await user.send(dm_message)
+            tracked_media.mark_requester_notified(reason)
+
+            from core.media_tracking import get_media_tracker
+            get_media_tracker().save_tracking_data()
+
+            await self._send_receipt(
+                f"📬 Requester DM sent to <@{tracked_media.requester_user_id}> for **{tracked_media.title}** — {receipt_detail}."
+            )
+            logger.info(f"Sent requester availability DM to user {tracked_media.requester_user_id} for {tracked_media.title}")
+
+        except discord.Forbidden:
+            await self._send_receipt(
+                f"⚠️ Could not DM <@{tracked_media.requester_user_id}> for **{tracked_media.title}** because their DMs are disabled."
+            )
+            logger.warning(f"Cannot DM user {tracked_media.requester_user_id} - DMs are disabled")
+        except Exception as e:
+            await self._send_receipt(
+                f"⚠️ Failed to send requester DM to <@{tracked_media.requester_user_id}> for **{tracked_media.title}**: `{e}`"
+            )
+            logger.error(f"Error sending requester availability DM: {e}", exc_info=True)

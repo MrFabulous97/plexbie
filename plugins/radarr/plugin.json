@@ -1,0 +1,12 @@
+{
+    "name": "radarr",
+    "version": "1.0.0",
+    "description": "Movie management via Radarr",
+    "author": "Plexbie",
+    "enabled": false,
+    "dependencies": ["pyarr"],
+    "commands": [
+        "/radarr search",
+        "/radarr queue"
+    ]
+}

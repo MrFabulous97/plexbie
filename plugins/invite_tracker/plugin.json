@@ -1,0 +1,11 @@
+{
+    "name": "invite_tracker",
+    "version": "1.0.0",
+    "description": "Track Discord invites and auto-assign Homies role to bot owner invites",
+    "author": "Plexbie",
+    "enabled": true,
+    "dependencies": [],
+    "commands": [
+        "/who-invited"
+    ]
+}

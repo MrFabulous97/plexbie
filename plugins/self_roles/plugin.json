@@ -1,0 +1,9 @@
+{
+    "name": "self_roles",
+    "version": "1.0.0",
+    "description": "Self-assignable Nerd role - Automatically attaches to existing message",
+    "author": "Plexbie",
+    "enabled": true,
+    "dependencies": [],
+    "commands": []
+}

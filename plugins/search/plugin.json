@@ -1,0 +1,11 @@
+{
+    "name": "search",
+    "version": "1.0.0",
+    "description": "Search Plex libraries",
+    "author": "Plexbie",
+    "enabled": false,
+    "dependencies": [],
+    "commands": [
+        "/plex search"
+    ]
+}

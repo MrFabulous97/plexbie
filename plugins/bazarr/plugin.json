@@ -1,0 +1,9 @@
+{
+    "name": "bazarr",
+    "version": "1.0.0",
+    "description": "Subtitle notifications from Bazarr",
+    "author": "Plexbie",
+    "enabled": false,
+    "dependencies": [],
+    "commands": []
+}

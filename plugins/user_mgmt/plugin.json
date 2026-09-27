@@ -1,0 +1,11 @@
+{
+    "name": "user_mgmt",
+    "version": "2.0.0",
+    "description": "Automatic user inactivity tracking with 30-day removal",
+    "author": "Plexbie",
+    "enabled": true,
+    "dependencies": [],
+    "commands": [
+        "/removeuser - Manually remove a user from Plex (Admin only)"
+    ]
+}

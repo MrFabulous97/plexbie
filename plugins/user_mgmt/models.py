@@ -1,0 +1,45 @@
+"""Database models for user management"""
+from datetime import datetime, timezone
+from typing import Optional
+
+from sqlalchemy import String, Integer, DateTime, Boolean
+from sqlalchemy.orm import Mapped, mapped_column
+
+from database.models import Base
+
+
+def utc_now() -> datetime:
+    """Return current UTC datetime (timezone-aware)"""
+    return datetime.now(timezone.utc)
+
+
+class PlexUser(Base):
+    """Track Plex users and their Discord associations"""
+    __tablename__ = "plex_users"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+
+    # Discord info
+    discord_id: Mapped[Optional[int]] = mapped_column(Integer, unique=True, nullable=True, index=True)
+    discord_username: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+
+    # Plex info
+    plex_username: Mapped[str] = mapped_column(String(255), unique=True, nullable=False, index=True)
+    plex_email: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    plex_user_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+
+    # Activity tracking
+    last_watched: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    days_inactive: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    warning_sent: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+
+    # Timestamps
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, onupdate=utc_now, nullable=False)
+
+    # Stats (optional - for farewell message)
+    total_watch_time: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)  # in seconds
+    total_plays: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+
+    def __repr__(self):
+        return f"<PlexUser(plex_username=\"{self.plex_username}\", discord_id={self.discord_id}, days_inactive={self.days_inactive})>"

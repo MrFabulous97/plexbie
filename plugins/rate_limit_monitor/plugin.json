@@ -1,0 +1,9 @@
+{
+    "name": "rate_limit_monitor",
+    "version": "1.0.0",
+    "description": "Monitor Discord API rate limits and request patterns",
+    "author": "Plexbie",
+    "enabled": true,
+    "dependencies": [],
+    "commands": []
+}

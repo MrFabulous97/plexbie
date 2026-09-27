@@ -1,0 +1,115 @@
+# path: core/plugin_manager.py
+"""Plugin discovery and management system"""
+import json
+from pathlib import Path
+from typing import Dict, List
+
+import discord
+from discord.ext import commands
+
+from core.logging import get_logger
+from core.services import BotServices
+
+logger = get_logger(__name__)
+
+
+class PluginManager:
+    """Manages plugin discovery, loading, and lifecycle"""
+    
+    def __init__(self, bot: commands.Bot, services: BotServices):
+        self.bot = bot
+        self.services = services
+        self.plugins: Dict[str, dict] = {}
+        self.loaded_cogs: List[str] = []
+    
+    async def load_all_plugins(self):
+        """Discover and load all plugins from plugins directory"""
+        plugins_dir = Path("plugins")
+
+        if not plugins_dir.exists():
+            logger.warning(f"⚠️  Plugins directory not found at: {plugins_dir.absolute()}")
+            return
+
+        plugin_count = 0
+        for plugin_dir in plugins_dir.iterdir():
+            if not plugin_dir.is_dir():
+                continue
+
+            plugin_count += 1
+            await self.load_plugin(plugin_dir)
+
+        logger.info(f"✅ Plugins: Loaded {len(self.loaded_cogs)}/{plugin_count} available plugins")
+    
+    async def load_plugin(self, plugin_dir: Path):
+        """Load a single plugin"""
+        plugin_name = plugin_dir.name
+        
+        # Check for required files
+        plugin_json = plugin_dir / "plugin.json"
+        cog_py = plugin_dir / "cog.py"
+        
+        if not plugin_json.exists():
+            logger.warning(f"Plugin {plugin_name} missing plugin.json")
+            return
+        
+        if not cog_py.exists():
+            logger.warning(f"Plugin {plugin_name} missing cog.py")
+            return
+        
+        try:
+            # Load plugin metadata
+            with open(plugin_json) as f:
+                metadata = json.load(f)
+            
+            self.plugins[plugin_name] = metadata
+            
+            # Check if enabled
+            if not metadata.get("enabled", True):
+                # Disabled plugins are silently skipped
+                return
+
+            # Import and load cog
+            import_path = f"plugins.{plugin_name}.cog"
+
+            # Dynamic import
+            module = __import__(import_path, fromlist=["setup"])
+
+            # Get cog class - convert plugin_name to PascalCase (e.g., watch_tracking -> WatchTracking)
+            class_name = ''.join(word.capitalize() for word in plugin_name.split('_'))
+            cog_class = getattr(module, f"{class_name}Cog", None)
+
+            if cog_class:
+                # Initialize cog with services
+                cog_instance = cog_class(self.bot, self.services)
+
+                # Add to bot
+                await self.bot.add_cog(cog_instance)
+                self.loaded_cogs.append(plugin_name)
+                # Suppress individual plugin load messages
+            else:
+                logger.warning(f"⚠️  Plugin {plugin_name}: No cog class found")
+                
+        except Exception as e:
+            logger.error(f"Failed to load plugin {plugin_name}: {e}", exc_info=e)
+    
+    async def unload_plugin(self, plugin_name: str):
+        """Unload a plugin"""
+        if plugin_name in self.loaded_cogs:
+            await self.bot.remove_cog(f"{plugin_name.title()}Cog")
+            self.loaded_cogs.remove(plugin_name)
+            logger.info(f"Unloaded plugin: {plugin_name}")
+    
+    async def reload_plugin(self, plugin_name: str):
+        """Reload a plugin"""
+        await self.unload_plugin(plugin_name)
+        plugin_dir = Path(f"plugins/{plugin_name}")
+        await self.load_plugin(plugin_dir)
+
+    async def register_webhook_routes(self, webhook_server):
+        """Allow plugins to register webhook routes before server starts"""
+        for cog in self.bot.cogs.values():
+            if hasattr(cog, "register_webhook_routes"):
+                try:
+                    await cog.register_webhook_routes(webhook_server)
+                except Exception as e:
+                    logger.error(f"Error registering webhook routes for {cog.__class__.__name__}: {e}")

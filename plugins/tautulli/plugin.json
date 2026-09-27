@@ -1,0 +1,13 @@
+{
+    "name": "tautulli",
+    "version": "1.0.0",
+    "description": "Analytics and watch history via Tautulli",
+    "author": "Plexbie",
+    "enabled": false,
+    "dependencies": [],
+    "commands": [
+        "/stats history",
+        "/stats top",
+        "/stats now"
+    ]
+}
