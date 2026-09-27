@@ -34,20 +34,31 @@ def _copy_embed(embed: Optional[discord.Embed]) -> Optional[discord.Embed]:
 
 
 async def _send_admin_receipt(bot, services, *, header: str, content: Optional[str] = None, embed: Optional[discord.Embed] = None):
-    channel = await _get_admin_channel(bot, services)
-    if not channel:
-        return
+    """Mirror a DM to the admin channel. Never raises.
 
-    message = header
-    if content:
-        message = f"{message}\n{content}"
+    Mirroring is an observability feature and must not be able to fail the
+    operation it is reporting on. Previously an exception here propagated out of
+    send_user_dm, so a failure to post the receipt was indistinguishable from the
+    DM itself failing - and callers acted on that: user_invites.approve aborted
+    after the Plex invite had already been sent and the role assigned.
+    """
+    try:
+        channel = await _get_admin_channel(bot, services)
+        if not channel:
+            return
 
-    kwargs = {"content": message}
-    copied = _copy_embed(embed)
-    if copied is not None:
-        kwargs["embed"] = copied
+        message = header
+        if content:
+            message = f"{message}\n{content}"
 
-    await channel.send(**kwargs)
+        kwargs = {"content": message}
+        copied = _copy_embed(embed)
+        if copied is not None:
+            kwargs["embed"] = copied
+
+        await channel.send(**kwargs)
+    except Exception as e:
+        logger.warning(f"Could not mirror to the admin channel: {e}")
 
 
 async def send_user_dm(bot, services, user, *, context: str, content: Optional[str] = None, embed: Optional[discord.Embed] = None):

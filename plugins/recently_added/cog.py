@@ -7,6 +7,7 @@ from typing import Optional, List
 
 import plexapi.exceptions
 from core.blocking import run_blocking
+from utils.formatting import episode_label
 from core.logging import get_logger
 from core.services import BotServices
 from utils.embeds import create_media_embed, create_error_embed, PaginationView
@@ -127,10 +128,12 @@ class RecentlyAddedCog(commands.Cog):
 
                     # For TV shows, add episode info
                     if media_type == "episode":
-                        show_title = item.grandparentTitle
-                        season = item.parentIndex
-                        episode = item.index
-                        title = f"{show_title} - S{season:02d}E{episode:02d}: {item.title}"
+                        title = episode_label(
+                            item.grandparentTitle,
+                            item.parentIndex,
+                            item.index,
+                            item.title,
+                        )
 
                     embed.add_field(
                         name=title[:256],  # Discord field name limit

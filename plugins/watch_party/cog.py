@@ -11,6 +11,7 @@ from discord.ext import commands, tasks
 from sqlalchemy import select, update
 
 from core.blocking import run_blocking
+from utils.formatting import episode_label
 from core.logging import get_logger
 from core.services import BotServices
 from database.session import get_session
@@ -143,13 +144,19 @@ class WatchPartyCog(commands.Cog):
         return None
 
     def _format_media_title(self, session_info: dict) -> str:
-        """Format media title from Plex session info"""
+        """Format media title from Plex session info.
+
+        Note the dict is built with getattr(session, 'parentIndex', None), so the
+        key exists with value None and .get(key, 0) returns None rather than the
+        default - which then raised TypeError when formatted with :02d.
+        """
         if session_info.get('type') == 'episode':
-            show = session_info.get('grandparentTitle', 'Unknown Show')
-            season = session_info.get('parentIndex', 0)
-            episode = session_info.get('index', 0)
-            title = session_info.get('title', '')
-            return f"{show} - S{season:02d}E{episode:02d}: {title}"
+            return episode_label(
+                session_info.get('grandparentTitle'),
+                session_info.get('parentIndex'),
+                session_info.get('index'),
+                session_info.get('title'),
+            )
         return session_info.get('title', 'Unknown Media')
 
     # ==================== Voice State Event Handler ====================

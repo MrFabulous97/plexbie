@@ -21,6 +21,11 @@ logger = get_logger(__name__)
 # Storage file
 # INVITES_FILE removed - now using database kv_store
 INVITES_NAMESPACE = "plex_invites"
+# Admin message id -> the request it represents, so a persistent view can recover
+# its state after a restart. Deliberately a SEPARATE namespace: user_mgmt's
+# auto_link_users iterates plex_invites and reads every key as a Discord user id,
+# so message ids must never land there.
+INVITE_MESSAGES_NAMESPACE = "plex_invite_messages"
 
 
 class PlexInviteApprovalView(AdminOnlyView):
@@ -29,15 +34,59 @@ class PlexInviteApprovalView(AdminOnlyView):
     Admin-gated: approving grants real Plex library access via inviteFriend and
     assigns the Plex member role, so it must never dispatch to a non-admin.
     """
-    def __init__(self, user_id: int, email: str, services: BotServices):
+    def __init__(
+        self,
+        user_id: int = None,
+        email: str = None,
+        services: BotServices = None,
+    ):
+        # Every argument is optional so setup() can register this view with no
+        # arguments (bot.add_view(PlexInviteApprovalView())). State is recovered
+        # per-interaction by _ensure_loaded().
         super().__init__(timeout=None)
         self.user_id = user_id
         self.email = email
         self.services = services
-    
-    @discord.ui.button(label="Approve & Send Invite", style=discord.ButtonStyle.success)
+
+    async def _ensure_loaded(self, interaction: discord.Interaction) -> bool:
+        """Populate state from storage when this view came from a restart.
+
+        A persistent view registered at startup has no per-request state, so it
+        is looked up by the admin message id. Previously this view was never
+        registered at all and its buttons carried no custom_id, so after any
+        restart - including every deploy - clicking Approve returned "This
+        interaction failed" and the request became silently unactionable.
+        """
+        if self.user_id and self.email and self.services:
+            return True
+
+        record = await kv_get(INVITE_MESSAGES_NAMESPACE, str(interaction.message.id))
+        if not record:
+            logger.error(
+                f"No stored invite request for message {interaction.message.id}"
+            )
+            await interaction.followup.send(
+                "❌ Could not find this request's data. Ask the user to run "
+                "`/join-plex` again.",
+                ephemeral=True,
+            )
+            return False
+
+        self.user_id = record.get("user_id")
+        self.email = record.get("email")
+        self.services = interaction.client.services
+        return bool(self.user_id and self.email)
+
+    @discord.ui.button(
+        label="Approve & Send Invite",
+        style=discord.ButtonStyle.success,
+        custom_id="plex_invite_approve",
+    )
     async def approve(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer()
+
+        if not await self._ensure_loaded(interaction):
+            return
 
         # Send Plex invite
         success, plex_username = await self._send_plex_invite()
@@ -90,13 +139,22 @@ class PlexInviteApprovalView(AdminOnlyView):
         else:
             await interaction.followup.send("Failed to send Plex invite. Please check logs.", ephemeral=True)
     
-    @discord.ui.button(label="Deny", style=discord.ButtonStyle.danger)
+    @discord.ui.button(
+        label="Deny",
+        style=discord.ButtonStyle.danger,
+        custom_id="plex_invite_deny",
+    )
     async def deny(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.edit_message(
+        await interaction.response.defer()
+
+        if not await self._ensure_loaded(interaction):
+            return
+
+        await interaction.message.edit(
             content=f"❌ **Denied by {interaction.user.name}**",
             view=None
         )
-        
+
         # Notify user
         user = interaction.client.get_user(self.user_id)
         if user:
@@ -210,6 +268,8 @@ class UserInvitesCog(commands.Cog):
     def __init__(self, bot: commands.Bot, services: BotServices):
         self.bot = bot
         self.services = services
+        # Discord ids with a /join-plex flow currently awaiting a DM reply.
+        self._in_progress: set = set()
         
     
     @app_commands.command(name="join-plex", description="Request access to the Plex server")
@@ -228,8 +288,25 @@ class UserInvitesCog(commands.Cog):
                 )
                 return
         
-        await interaction.response.send_message("Check your DMs!", ephemeral=True)
-        
+        # One flow per user at a time. The wait_for check below matches any DM from
+        # this user, so two concurrent flows would both be resolved by a single
+        # reply - producing two admin approval messages, two saved requests, and
+        # potentially two Plex invites for one request.
+        if interaction.user.id in self._in_progress:
+            await interaction.response.send_message(
+                "You already have a request in progress - check your DMs and reply "
+                "there with your email address.",
+                ephemeral=True,
+            )
+            return
+
+        # Defer rather than replying now: the DM is attempted first, so the reply
+        # can tell the truth about whether it actually arrived. Previously the user
+        # was told "Check your DMs!" before any DM was sent, and a blocked DM was
+        # only logged - leaving them waiting for a message that never came.
+        await interaction.response.defer(ephemeral=True)
+        self._in_progress.add(interaction.user.id)
+
         try:
             # Send DM requesting email
             embed = discord.Embed(
@@ -246,6 +323,9 @@ class UserInvitesCog(commands.Cog):
             )
             
             await send_user_dm(self.bot, self.services, interaction.user, context="join-plex email collection prompt", embed=embed)
+
+            # The DM is confirmed sent, so this is now truthful.
+            await interaction.followup.send("Check your DMs!", ephemeral=True)
             
             # Wait for email response
             def check(m):
@@ -267,16 +347,35 @@ class UserInvitesCog(commands.Cog):
             
             await send_user_dm(self.bot, self.services, interaction.user, context="join-plex request submitted", content="Email received! Your request has been sent to the admin for approval.")
             
+            # Save the request BEFORE notifying admins. _send_to_admin records the
+            # message id against this record, and previously ran first - so its
+            # kv_get found nothing, the message id was silently dropped, and
+            # _save_request then overwrote the record without it.
+            await self._save_request(interaction.user.id, email)
+
             # Send to admin channel
             await self._send_to_admin(interaction, email)
             
-            # Save request
-            await self._save_request(interaction.user.id, email)
-            
         except discord.Forbidden:
             logger.warning(f"Could not DM user {interaction.user.id} for /join-plex")
+            await interaction.followup.send(
+                "❌ I could not send you a DM. Enable **Allow direct messages from "
+                "server members** in your Privacy Settings for this server, then "
+                "run `/join-plex` again.",
+                ephemeral=True,
+            )
         except Exception as e:
             logger.error(f"Join-plex error for user {interaction.user.id}: {e}", exc_info=True)
+            try:
+                await interaction.followup.send(
+                    "❌ Something went wrong starting your request. Please try again.",
+                    ephemeral=True,
+                )
+            except discord.HTTPException:
+                pass
+        finally:
+            # Always release the guard, or the user could never retry.
+            self._in_progress.discard(interaction.user.id)
     
     async def _send_to_admin(self, interaction: discord.Interaction, email: str):
         """Send invite request to admin channel"""
@@ -302,7 +401,16 @@ class UserInvitesCog(commands.Cog):
         view = PlexInviteApprovalView(interaction.user.id, email, self.services)
         
         message = await admin_channel.send(embed=embed, view=view)
-        
+
+        # Record the message -> request mapping so the persistent view can recover
+        # its state after a restart. Written unconditionally rather than as an
+        # update to an existing record, which is what previously failed silently.
+        await kv_set(INVITE_MESSAGES_NAMESPACE, str(message.id), {
+            "user_id": interaction.user.id,
+            "email": email,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        })
+
         # Update saved request with message ID
         invite_data = await kv_get(INVITES_NAMESPACE, str(interaction.user.id))
         if invite_data:
@@ -321,3 +429,7 @@ class UserInvitesCog(commands.Cog):
 async def setup(bot: commands.Bot):
     """Setup function for loading cog"""
     await bot.add_cog(UserInvitesCog(bot, bot.services))
+    # Register the persistent view so pending approval messages keep working after
+    # a restart. Requires every button to carry a custom_id, which they now do -
+    # add_view raises ValueError otherwise.
+    bot.add_view(PlexInviteApprovalView())

@@ -9,6 +9,7 @@ from collections import defaultdict
 import discord
 from discord.ext import commands, tasks
 
+from utils.formatting import episode_label, season_episode
 from core.logging import get_logger
 from core.services import BotServices
 from database.kv_store import kv_get, kv_set, kv_get_all
@@ -378,7 +379,7 @@ class NewMediaAddedCog(commands.Cog):
                 if not should_publish_updates:
                     logger.info(
                         f"Skipping updates-channel episode post for tracked request {show_title} "
-                        f"S{season:02d}E{episode:02d}; waiting for first requested season premiere only"
+                        f"{season_episode(season, episode)}; waiting for first requested season premiere only"
                     )
 
             # Determine if we should post or edit
@@ -436,7 +437,9 @@ class NewMediaAddedCog(commands.Cog):
 
         episode_list = self._format_episode_list(batch.episodes)
         if len(batch.episodes) == 1:
-            description = f"{batch.show_title} - S{batch.season:02d}E{batch.episodes[0]:02d}: {episode_title}"
+            description = episode_label(
+                batch.show_title, batch.season, batch.episodes[0], episode_title
+            )
         else:
             description = f"{batch.show_title} - Season {batch.season}, Episodes {episode_list}"
 

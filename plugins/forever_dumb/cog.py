@@ -15,6 +15,29 @@ logger = get_logger(__name__)
 # Color code for "Certified Dummy" users
 CERTIFIED_DUMMY_COLOR = 0x3c302c  # Brown color
 
+# Discord rejects nicknames longer than this with a 400.
+MAX_NICKNAME_LENGTH = 32
+DUMMY_SUFFIX = ": Certified Dummy"
+
+
+def dummy_nickname(base_name: str, times: int = 1) -> str:
+    """Build the Certified Dummy nickname, trimmed to Discord's 32-char limit.
+
+    The suffix is 17 characters, so any display name over 15 produced a nickname
+    Discord rejects with HTTPException (400). That was not caught - only
+    discord.Forbidden was, and Forbidden is a SUBCLASS of HTTPException, so the
+    400 escaped every handler. The role had already been assigned by then, so the
+    user ended up permanently Forever Dumb while seeing only "This interaction
+    failed". Names of 16+ characters are the common case.
+    """
+    suffix = DUMMY_SUFFIX if times <= 1 else f"{DUMMY_SUFFIX} x{times}"
+    room = MAX_NICKNAME_LENGTH - len(suffix)
+    if room <= 0:
+        # Pathological (a huge multiplier); keep the suffix, drop the name.
+        return suffix[:MAX_NICKNAME_LENGTH]
+    return f"{base_name[:room].rstrip()}{suffix}"
+
+
 # Storage file for role backups (shared with self_roles)
 ROLES_NAMESPACE = "role_backup"
 DUMB_FAMILY_NAMESPACE = "dumb_family"
@@ -158,7 +181,7 @@ class ForeverDumbView(discord.ui.View):
                 base_name = base_name.replace(": Certified Dummy", "").strip()
 
             # Set nickname with Certified Dummy suffix
-            new_nickname = f"{base_name}: Certified Dummy"
+            new_nickname = dummy_nickname(base_name)
             nickname_set = False
             nickname_message = ""
 
@@ -174,6 +197,13 @@ class ForeverDumbView(discord.ui.View):
                 except discord.Forbidden:
                     nickname_message = "\n\n⚠️ **Note:** I don't have permission to change your nickname. Please manually add `: Certified Dummy` to your name."
                     logger.warning(f"Could not set nickname for {member} (insufficient permissions)")
+                except discord.HTTPException as e:
+                    # Forbidden is a subclass of HTTPException, so this must come
+                    # second. Catching it at all matters because the role is
+                    # already assigned by this point - letting it escape left the
+                    # user Forever Dumb with only "This interaction failed".
+                    nickname_message = "\n\n⚠️ **Note:** I could not change your nickname. Please manually add `: Certified Dummy` to your name."
+                    logger.warning(f"Could not set nickname for {member}: {e}")
 
             # Build response message
             response_parts = [
@@ -347,19 +377,21 @@ class ForeverDumbCog(commands.Cog):
 
                 # First, check if the OLD nickname had a counter we need to preserve
                 old_match = re.search(r': Certified Dummy(?: x(\d+))?$', before.display_name)
-                counter_suffix = ""
-
+                preserved_count = 1
                 if old_match and old_match.group(1):
-                    # Preserve the counter from the old nickname
-                    counter_suffix = f" x{old_match.group(1)}"
+                    # Preserve (do not increment) the counter from the old nickname
+                    try:
+                        preserved_count = int(old_match.group(1))
+                    except ValueError:
+                        preserved_count = 1
 
                 # Extract base name (remove any existing Certified Dummy suffix from current nickname)
                 base_name = current_nick
                 if ": Certified Dummy" in base_name:
                     base_name = re.sub(r': Certified Dummy(?: x\d+)?$', '', base_name).strip()
 
-                # Build new nickname with counter if it existed
-                new_nickname = f"{base_name}: Certified Dummy{counter_suffix}"
+                # Build new nickname with the counter if it existed
+                new_nickname = dummy_nickname(base_name, preserved_count)
 
                 try:
                     await after.edit(nick=new_nickname, reason="Forever Dumb - Enforcing Certified Dummy suffix")
@@ -381,7 +413,7 @@ class ForeverDumbCog(commands.Cog):
 
         # Set nickname when they rejoin
         base_name = member.name
-        new_nickname = f"{base_name}: Certified Dummy"
+        new_nickname = dummy_nickname(base_name)
         try:
             await member.edit(nick=new_nickname, reason="Forever Dumb - Restored Certified Dummy suffix")
             logger.info(f"Restored nickname for Forever Dumb member {member}: '{new_nickname}'")

@@ -8,6 +8,7 @@ from pathlib import Path
 import discord
 from discord.ext import commands
 
+from plugins.forever_dumb.cog import dummy_nickname
 from core.logging import get_logger
 from core.services import BotServices
 
@@ -184,7 +185,7 @@ class SmartDumbRoleView(discord.ui.View):
 
                     # Remove old suffix and add new one
                     base_name = current_nick[:match.start()]
-                    new_nickname = f"{base_name}: Certified Dummy x{new_count}"
+                    new_nickname = dummy_nickname(base_name, new_count)
 
                     try:
                         if member.id != guild.owner_id:

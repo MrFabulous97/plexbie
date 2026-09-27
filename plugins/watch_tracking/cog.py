@@ -10,6 +10,7 @@ from discord import app_commands
 from discord.ext import commands, tasks
 
 from core.blocking import run_blocking
+from utils.formatting import episode_label
 from core.logging import get_logger
 from core.services import BotServices
 from database.session import get_session
@@ -291,10 +292,12 @@ class WatchTrackingCog(commands.Cog):
                     field_value = f"{player_state} {title}\n`{progress_bar}`"
 
                     if session.type == 'episode':
-                        show = session.grandparentTitle
-                        season = session.parentIndex
-                        episode = session.index
-                        field_value = f"{player_state} {show} - S{season:02d}E{episode:02d}\n`{progress_bar}`"
+                        label = episode_label(
+                            session.grandparentTitle,
+                            session.parentIndex,
+                            session.index,
+                        )
+                        field_value = f"{player_state} {label}\n`{progress_bar}`"
 
                     embed.add_field(name=f"👤 {display_name}", value=field_value, inline=False)
             else:
