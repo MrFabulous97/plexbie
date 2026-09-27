@@ -110,7 +110,10 @@ class NewMediaAddedCog(commands.Cog):
                 logger.error(f"Plex webhook error: {e}")
                 return web.json_response({"error": str(e)}, status=400)
 
-        webhook_server.app.router.add_post("/webhook/plex", handle_plex_webhook)
+        # Register through the server so the route is signature-validated.
+        # Plex sends no auth header of its own, so protect it by appending
+        # ?token=<PLEX_WEBHOOK_SECRET> to the webhook URL in Plex settings.
+        webhook_server.add_validated_post("/webhook/plex", handle_plex_webhook, "plex")
         logger.info("✅ Registered Plex webhook handler at /webhook/plex")
 
     def cog_unload(self):

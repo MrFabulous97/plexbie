@@ -11,6 +11,7 @@ from discord.ext import commands, tasks
 from discord.ui import Button, View
 
 from core.logging import get_logger
+from core.permissions import AdminOnlyView, require_admin
 from core.services import BotServices
 from utils.embeds import create_info_embed, create_error_embed
 from database.kv_store import kv_get, kv_set
@@ -35,8 +36,12 @@ DEFAULT_CONFIG = {
 }
 
 
-class CleanupControlPanel(View):
-    """Interactive control panel for media cleanup"""
+class CleanupControlPanel(AdminOnlyView):
+    """Interactive control panel for media cleanup.
+
+    Admin-gated by AdminOnlyView.interaction_check, which runs before any button
+    callback below - do not re-check per button.
+    """
 
     def __init__(self, cog):
         super().__init__(timeout=None)  # Persistent view
@@ -45,13 +50,6 @@ class CleanupControlPanel(View):
     @discord.ui.button(label="📊 View Status", style=discord.ButtonStyle.primary, custom_id="cleanup_status")
     async def status_button(self, interaction: discord.Interaction, button: Button):
         """Show current cleanup status"""
-        if not interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message(
-                "You don't have permission to use this.",
-                ephemeral=True
-            )
-            return
-
         await interaction.response.defer(ephemeral=True)
 
         try:
@@ -107,13 +105,6 @@ class CleanupControlPanel(View):
     @discord.ui.button(label="🔄 Run Scan Now", style=discord.ButtonStyle.success, custom_id="cleanup_run")
     async def run_button(self, interaction: discord.Interaction, button: Button):
         """Run cleanup scan immediately"""
-        if not interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message(
-                "You don't have permission to use this.",
-                ephemeral=True
-            )
-            return
-
         await interaction.response.defer(ephemeral=True)
 
         try:
@@ -144,13 +135,6 @@ class CleanupControlPanel(View):
     @discord.ui.button(label="⚙️ Settings", style=discord.ButtonStyle.secondary, custom_id="cleanup_settings")
     async def settings_button(self, interaction: discord.Interaction, button: Button):
         """Show settings menu"""
-        if not interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message(
-                "You don't have permission to use this.",
-                ephemeral=True
-            )
-            return
-
         view = CleanupSettingsView(self.cog)
         embed = discord.Embed(
             title="⚙️ Cleanup Settings",
@@ -163,12 +147,11 @@ class CleanupControlPanel(View):
     @discord.ui.button(label="🔴 Toggle Dry Run", style=discord.ButtonStyle.danger, custom_id="cleanup_toggle_dry")
     async def toggle_dry_run_button(self, interaction: discord.Interaction, button: Button):
         """Toggle dry run mode"""
-        if not interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message(
-                "You don't have permission to use this.",
-                ephemeral=True
-            )
-            return
+        # Load persisted config before mutating it, otherwise save_config() would
+        # write DEFAULT_CONFIG back over the stored settings (losing exempt_items,
+        # exclude_libraries, inactivity_days, ...) whenever this fires before the
+        # first successful load.
+        await self.cog.load_data()
 
         self.cog.config["dry_run"] = not self.cog.config["dry_run"]
         await self.cog.save_config()
@@ -192,8 +175,12 @@ class CleanupControlPanel(View):
         logger.info(f"{interaction.user} toggled dry run to: {self.cog.config['dry_run']}")
 
 
-class CleanupSettingsView(View):
-    """Settings submenu for cleanup configuration"""
+class CleanupSettingsView(AdminOnlyView):
+    """Settings submenu for cleanup configuration.
+
+    Admin-gated by AdminOnlyView. Ephemeral delivery is not a permission
+    boundary, so this does not rely on how the view was sent.
+    """
 
     def __init__(self, cog):
         super().__init__(timeout=180)
@@ -202,6 +189,9 @@ class CleanupSettingsView(View):
     @discord.ui.button(label="✅ Enable/Disable", style=discord.ButtonStyle.secondary)
     async def toggle_enabled(self, interaction: discord.Interaction, button: Button):
         """Toggle cleanup enabled/disabled"""
+        # See toggle_dry_run_button: load before mutate-and-save.
+        await self.cog.load_data()
+
         self.cog.config["enabled"] = not self.cog.config["enabled"]
         await self.cog.save_config()
 
@@ -1125,11 +1115,7 @@ class MediaCleanupCog(commands.Cog):
         media_type: Optional[app_commands.Choice[str]] = None,
     ):
         """Add a specific media item to the cleanup exemption list"""
-        if not interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message(
-                "You don't have permission to use this command.",
-                ephemeral=True
-            )
+        if not await require_admin(interaction):
             return
 
         await self.load_data()
@@ -1182,11 +1168,7 @@ class MediaCleanupCog(commands.Cog):
     @app_commands.describe(title="Movie or show title to remove from the exemption list")
     async def cleanup_exempt_remove(self, interaction: discord.Interaction, title: str):
         """Remove a specific media item from the cleanup exemption list"""
-        if not interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message(
-                "You don't have permission to use this command.",
-                ephemeral=True
-            )
+        if not await require_admin(interaction):
             return
 
         await self.load_data()
@@ -1238,11 +1220,7 @@ class MediaCleanupCog(commands.Cog):
     @app_commands.command(name="cleanup-exempt-list", description="List media currently exempt from automatic cleanup")
     async def cleanup_exempt_list(self, interaction: discord.Interaction):
         """List the current cleanup exemption entries"""
-        if not interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message(
-                "You don't have permission to use this command.",
-                ephemeral=True
-            )
+        if not await require_admin(interaction):
             return
 
         await self.load_data()
@@ -1280,11 +1258,7 @@ class MediaCleanupCog(commands.Cog):
     @app_commands.command(name="cleanup", description="Media cleanup control panel (Admin only)")
     async def cleanup_panel(self, interaction: discord.Interaction):
         """Show the interactive cleanup control panel"""
-        if not interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message(
-                "You don't have permission to use this command.",
-                ephemeral=True
-            )
+        if not await require_admin(interaction):
             return
 
         # Ensure data is loaded
@@ -1326,11 +1300,7 @@ class MediaCleanupCog(commands.Cog):
         notification_channel: Optional[discord.TextChannel] = None
     ):
         """Configure cleanup settings (for advanced options)"""
-        if not interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message(
-                "You don't have permission to use this command.",
-                ephemeral=True
-            )
+        if not await require_admin(interaction):
             return
 
         changes = []

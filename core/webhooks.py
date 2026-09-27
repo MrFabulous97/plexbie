@@ -20,23 +20,30 @@ class WebhookServer:
         self.app = web.Application()
         self.runner = None
         self.validator = WebhookValidator(services.config)
+        # Services whose routes actually run through add_validated_post, so the
+        # startup banner can report what is really protected.
+        self._registered_services = set()
         self.setup_routes()
+
+    def add_validated_post(self, path: str, handler, service: str):
+        """Register a POST webhook route behind signature validation.
+
+        Every inbound webhook route must be registered through here. Calling
+        ``self.app.router.add_post`` directly silently bypasses authentication,
+        which is how /webhook/sonarr, /webhook/radarr and /webhook/plex ended up
+        unauthenticated while the startup banner claimed otherwise.
+        """
+        self.app.router.add_post(
+            path,
+            create_validated_handler(handler, self.validator, service)
+        )
+        self._registered_services.add(service)
 
     def setup_routes(self):
         """Configure webhook endpoints with validation"""
-        # Wrap handlers with signature validation
-        self.app.router.add_post(
-            "/webhook/tautulli",
-            create_validated_handler(self._handle_tautulli, self.validator, "tautulli")
-        )
-        self.app.router.add_post(
-            "/webhook/overseerr",
-            create_validated_handler(self._handle_overseerr, self.validator, "overseerr")
-        )
-        self.app.router.add_post(
-            "/webhook/bazarr",
-            self._handle_bazarr  # Bazarr doesnt support webhook auth
-        )
+        self.add_validated_post("/webhook/tautulli", self._handle_tautulli, "tautulli")
+        self.add_validated_post("/webhook/overseerr", self._handle_overseerr, "overseerr")
+        self.add_validated_post("/webhook/bazarr", self._handle_bazarr, "bazarr")
         self.app.router.add_get("/health", self._handle_health)
 
     async def start(self):
@@ -51,22 +58,34 @@ class WebhookServer:
 
         logger.info(f"Webhook server listening on port {port}")
 
-        # Log webhook security status
-        secrets_configured = []
-        if self.services.config.sonarr_webhook_secret:
-            secrets_configured.append("Sonarr")
-        if self.services.config.radarr_webhook_secret:
-            secrets_configured.append("Radarr")
-        if self.services.config.tautulli_webhook_secret:
-            secrets_configured.append("Tautulli")
-        if self.services.config.overseerr_webhook_secret:
-            secrets_configured.append("Overseerr")
+        self._log_auth_status()
 
-        if secrets_configured:
-            services_list = ", ".join(secrets_configured)
-            logger.info(f"   Webhook auth enabled for: {services_list}")
-        else:
-            logger.warning("   No webhook secrets configured - webhooks are unauthenticated")
+    def _log_auth_status(self):
+        """Report per-route auth status.
+
+        A route is only authenticated when it was registered through
+        add_validated_post AND a secret is configured for it, so report the
+        intersection. Reporting merely-configured secrets previously told
+        operators that Sonarr/Radarr were protected when their routes did not
+        run the validator at all.
+        """
+        protected = []
+        unprotected = []
+
+        for service in sorted(self._registered_services):
+            if self.validator._get_secret(service):
+                protected.append(service.title())
+            else:
+                unprotected.append(service.title())
+
+        if protected:
+            logger.info(f"   🔒 Webhook auth enforced for: {', '.join(protected)}")
+        if unprotected:
+            logger.warning(
+                f"   ⚠️  Unauthenticated webhook routes (no secret set): {', '.join(unprotected)}"
+            )
+        if not protected:
+            logger.warning("   No webhook secrets configured - all webhooks are unauthenticated")
 
     async def stop(self):
         """Stop the webhook server"""

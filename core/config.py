@@ -88,6 +88,10 @@ class Config(BaseModel):
     radarr_webhook_secret: Optional[str] = Field(default_factory=lambda: os.getenv("RADARR_WEBHOOK_SECRET"))
     tautulli_webhook_secret: Optional[str] = Field(default_factory=lambda: os.getenv("TAUTULLI_WEBHOOK_SECRET"))
     overseerr_webhook_secret: Optional[str] = Field(default_factory=lambda: os.getenv("OVERSEERR_WEBHOOK_SECRET"))
+    # Plex sends no auth of its own; append ?token=<value> to the webhook URL.
+    plex_webhook_secret: Optional[str] = Field(default_factory=lambda: os.getenv("PLEX_WEBHOOK_SECRET"))
+    # Bazarr has no webhook auth; append ?secret=<value> to the webhook URL.
+    bazarr_webhook_secret: Optional[str] = Field(default_factory=lambda: os.getenv("BAZARR_WEBHOOK_SECRET"))
 
     # ---- Additional config matching original bot features ----
     # Discord resource IDs (stored as int for discord.py)

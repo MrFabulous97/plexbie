@@ -12,6 +12,7 @@ from discord import app_commands
 from discord.ext import commands
 
 from core.logging import get_logger
+from core.permissions import AdminOnlyView
 from core.services import BotServices
 from core.admin_mirror import send_user_dm
 from utils.embeds import create_error_embed
@@ -689,8 +690,11 @@ class BookConfirmationView(discord.ui.View):
             json.dump(requests_data, f, indent=2)
 
 
-class BookAdminApprovalView(discord.ui.View):
-    """Admin approval buttons for book requests"""
+class BookAdminApprovalView(AdminOnlyView):
+    """Admin approval buttons for book requests.
+
+    Admin-gated: approving submits downloads to NZBHydra/SABnzbd.
+    """
     def __init__(self, book: dict = None, user_id: int = None, services: BotServices = None):
         super().__init__(timeout=None)
         self.book = book
@@ -1132,8 +1136,12 @@ class ConfirmationView(discord.ui.View):
             json.dump(requests, f, indent=2)
 
 
-class AdminApprovalView(discord.ui.View):
-    """Admin approval buttons"""
+class AdminApprovalView(AdminOnlyView):
+    """Admin approval buttons.
+
+    Admin-gated: approving submits to Overseerr and changes Sonarr/Radarr
+    monitoring state.
+    """
     def __init__(self, media: dict = None, user_id: int = None, services: BotServices = None, seasons=None, monitor=False):
         super().__init__(timeout=None)  # Persistent
         self.media = media

@@ -1,0 +1,20 @@
+# Runtime state (lives in the appdata config/ mount)
+config/*.env
+config/*.db
+config/*.json
+logs/
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Editor / OS noise
+.DS_Store
+
+# Ad-hoc backups - use git history instead
+*.bak
+*.bak-*
+*.bak_*
+*.sync-conflict-*
+*.afterpatch-check

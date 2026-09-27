@@ -73,8 +73,8 @@ class Plexbie(commands.Bot):
         from webhooks.sonarr_handler import register_sonarr_webhook
         from webhooks.radarr_handler import register_radarr_webhook
 
-        register_sonarr_webhook(self.webhook_server.app, self)
-        register_radarr_webhook(self.webhook_server.app, self)
+        register_sonarr_webhook(self.webhook_server, self)
+        register_radarr_webhook(self.webhook_server, self)
 
         # Start webhook server (this freezes the router)
         await self.webhook_server.start()

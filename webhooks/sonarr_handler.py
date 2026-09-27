@@ -166,12 +166,17 @@ class SonarrWebhookHandler:
             logger.error(f"Error handling Sonarr SeriesAdd event: {e}", exc_info=True)
 
 
-def register_sonarr_webhook(app: web.Application, bot):
-    """Register Sonarr webhook route"""
+def register_sonarr_webhook(webhook_server, bot):
+    """Register Sonarr webhook route behind signature validation.
+
+    Takes the WebhookServer (not its raw aiohttp app) so the route goes through
+    add_validated_post. Registering on the app directly would skip the X-Api-Key
+    check in WebhookValidator._validate_arr_signature.
+    """
     handler = SonarrWebhookHandler(bot)
 
     async def webhook_endpoint(request: web.Request) -> web.Response:
         return await handler.handle_webhook(request)
 
-    app.router.add_post("/webhook/sonarr", webhook_endpoint)
+    webhook_server.add_validated_post("/webhook/sonarr", webhook_endpoint, "sonarr")
     logger.info("✅ Registered Sonarr webhook handler at /webhook/sonarr")

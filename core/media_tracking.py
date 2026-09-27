@@ -1,6 +1,7 @@
 # path: core/media_tracking.py
 """Centralized media tracking system for coordinating between plugins"""
 import json
+import os
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Any
@@ -225,12 +226,24 @@ class MediaTrackingManager:
                 logger.error(f"Error loading media tracking data: {e}")
 
     def save_tracking_data(self):
-        """Save tracking data to file"""
+        """Save tracking data to file atomically.
+
+        Writes to a temp file in the same directory then os.replace()s it into
+        place, which is atomic on POSIX. A plain open(path, "w") truncates first,
+        so a crash or container restart mid-write (this is called from the Sonarr
+        and Radarr webhook request paths) left invalid JSON - and
+        load_tracking_data then silently started from an empty dict, losing every
+        requester mapping.
+        """
         try:
-            TRACKING_FILE.parent.mkdir(exist_ok=True)
+            TRACKING_FILE.parent.mkdir(parents=True, exist_ok=True)
             data = {key: media.to_dict() for key, media in self.tracked_media.items()}
-            with open(TRACKING_FILE, "w") as f:
+            tmp_path = TRACKING_FILE.with_suffix(TRACKING_FILE.suffix + ".tmp")
+            with open(tmp_path, "w") as f:
                 json.dump(data, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, TRACKING_FILE)
         except Exception as e:
             logger.error(f"Error saving media tracking data: {e}")
 

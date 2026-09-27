@@ -106,19 +106,28 @@ class UserMgmtCog(commands.Cog):
                         tracked_user.last_watched = last_watched
                         tracked_user.days_inactive = days_since
 
-                        # Reset warning flag if user became active again
-                        if days_since < 25:
+                        # Reset warning flag if user became active again. Use the
+                        # configured threshold, not a hardcoded 25, so the reset and
+                        # the warning below cannot desynchronize.
+                        if days_since < self.services.config.inactivity_warning_days:
                             tracked_user.warning_sent = False
 
                         logger.info(f"User {tracked_user.plex_username}: {days_since} days inactive")
 
-                        # Day 25 warning
-                        if days_since == self.services.config.inactivity_warning_days and not tracked_user.warning_sent:
+                        # Warning uses >= not ==: this loop runs every 24h and restarts
+                        # with the bot, so an exact-day match is skipped whenever a
+                        # pass is missed, and the user would then hit the removal
+                        # threshold having never been warned.
+                        if days_since >= self.services.config.inactivity_warning_days and not tracked_user.warning_sent:
                             await self._send_warning_dm(tracked_user)
                             tracked_user.warning_sent = True
+                            # Deliberately do not remove on the same pass that warns,
+                            # even if already past the removal threshold: a warning
+                            # nobody had a chance to act on is not a warning.
+                            continue
 
-                        # Day 30 removal
-                        elif days_since >= self.services.config.inactivity_removal_days:
+                        # Removal, only ever after a warning was delivered.
+                        if days_since >= self.services.config.inactivity_removal_days:
                             user_id = tautulli_user.get('user_id', 0)
                             await self._remove_inactive_user(tracked_user, user_id, session)
                             continue  # User removed, skip update
@@ -134,10 +143,13 @@ class UserMgmtCog(commands.Cog):
                             days_since = (datetime.now(timezone.utc) - last_watched_aware).days
                             tracked_user.days_inactive = days_since
 
-                            if days_since == self.services.config.inactivity_warning_days and not tracked_user.warning_sent:
+                            # Same warn-then-remove sequencing as the branch above.
+                            if days_since >= self.services.config.inactivity_warning_days and not tracked_user.warning_sent:
                                 await self._send_warning_dm(tracked_user)
                                 tracked_user.warning_sent = True
-                            elif days_since >= self.services.config.inactivity_removal_days:
+                                continue
+
+                            if days_since >= self.services.config.inactivity_removal_days:
                                 user_id = tautulli_user.get('user_id', 0)
                                 await self._remove_inactive_user(tracked_user, user_id, session)
                                 continue
@@ -315,14 +327,19 @@ class UserMgmtCog(commands.Cog):
     async def _remove_inactive_user(self, user: PlexUser, plex_user_id: int, session: AsyncSession):
         """Remove user from Plex and send farewell message"""
         try:
-            # Get user stats from Tautulli
+            # Collect stats up front (needs the account to still exist in Tautulli),
+            # but do not announce anything until the removal actually succeeds -
+            # otherwise a failed removal DMs a farewell on every daily pass.
             stats = await self._get_user_stats(user.plex_username)
 
-            # Send farewell DM
-            if user.discord_id:
-                await self._send_farewell_dm(user, stats)
-
             # Remove from Plex
+            if not self.services.config.plex_username or not self.services.config.plex_password:
+                logger.error(
+                    f"Cannot remove {user.plex_username} from Plex: PLEX_USERNAME/PLEX_PASSWORD "
+                    f"not configured. Keeping tracking row so this retries."
+                )
+                return
+
             try:
                 from plexapi.myplex import MyPlexAccount
 
@@ -334,10 +351,19 @@ class UserMgmtCog(commands.Cog):
                 account.removeFriend(friend_key)
                 logger.info(f"Removed {user.plex_username} from Plex server")
             except Exception as e:
-                logger.error(f"Error removing {user.plex_username} from Plex: {e}")
+                # Do NOT fall through to the database delete. Dropping the row
+                # after a failed removal leaves the user with Plex access forever
+                # and no record to retry against.
+                logger.error(
+                    f"Error removing {user.plex_username} from Plex: {e} - "
+                    f"keeping tracking row so the next pass retries",
+                    exc_info=True
+                )
+                return
 
-            # Remove Plex role from Discord
+            # Removal succeeded - now notify and clean up Discord state.
             if user.discord_id:
+                await self._send_farewell_dm(user, stats)
                 await self._remove_plex_role(user.discord_id)
 
             # Remove from database

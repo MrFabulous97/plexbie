@@ -1143,13 +1143,16 @@ async def process_item(
 
     dest.mkdir(parents=True, exist_ok=True)
 
-    # 5. Move book files
+    # 5. Move book files. Track failures: step 8 must not delete the source tree
+    # while any file is still only present there.
+    failed_moves = []
     for f in book_files:
         target = dest / f.name
         try:
             shutil.move(str(f), str(target))
             logger.debug(f"Moved: {f.name}")
         except Exception as e:
+            failed_moves.append(f.name)
             logger.error(f"Failed to move {f.name}: {e}")
 
     # 6. Handle cover art
@@ -1185,8 +1188,15 @@ async def process_item(
     # 7. Generate metadata.opf
     generate_opf(final, dest / "metadata.opf")
 
-    # 8. Clean up source
-    if source_path.is_dir() and source_path.exists():
+    # 8. Clean up source - only when everything was successfully moved out of it.
+    # Deleting the source after a partial move permanently destroys the files that
+    # failed, since they exist nowhere else.
+    if failed_moves:
+        logger.error(
+            f"Keeping source {source_path} intact: {len(failed_moves)} file(s) failed "
+            f"to move ({', '.join(failed_moves)}). Resolve manually then re-run."
+        )
+    elif source_path.is_dir() and source_path.exists():
         try:
             shutil.rmtree(source_path)
             logger.debug(f"Removed source directory: {source_path.name}")
@@ -1195,8 +1205,8 @@ async def process_item(
     elif source_path.is_file() and source_path.exists():
         try:
             source_path.unlink()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"Could not remove source file {source_path.name}: {e}")
 
     # 9. Clean up hint file if used
     if hint_used and hint_file.exists():

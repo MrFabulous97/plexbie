@@ -11,6 +11,7 @@ from discord import app_commands
 from discord.ext import commands
 
 from core.logging import get_logger
+from core.permissions import AdminOnlyView
 from core.services import BotServices
 from core.admin_mirror import send_user_dm
 
@@ -21,8 +22,12 @@ logger = get_logger(__name__)
 INVITES_NAMESPACE = "plex_invites"
 
 
-class PlexInviteApprovalView(discord.ui.View):
-    """Admin approval buttons for Plex invites"""
+class PlexInviteApprovalView(AdminOnlyView):
+    """Admin approval buttons for Plex invites.
+
+    Admin-gated: approving grants real Plex library access via inviteFriend and
+    assigns the Plex member role, so it must never dispatch to a non-admin.
+    """
     def __init__(self, user_id: int, email: str, services: BotServices):
         super().__init__(timeout=None)
         self.user_id = user_id
@@ -45,9 +50,16 @@ class PlexInviteApprovalView(discord.ui.View):
                     await member.add_roles(role, reason="Plex access approved")
                     logger.info(f"Added Plex member role to {member.name}")
 
-            # Add to user tracking system
-            if plex_username:
+            # Add to user tracking system. Without a resolvable member we cannot
+            # record the Discord side of the mapping, and a silent miss here means
+            # the user keeps Plex access forever without inactivity tracking.
+            if plex_username and member:
                 await self._add_to_user_tracking(member, plex_username)
+            elif plex_username:
+                logger.error(
+                    f"Invited {self.email} to Plex but Discord member {self.user_id} "
+                    f"is not in the guild - NOT tracked for inactivity, link manually"
+                )
 
             # Update message
             await interaction.message.edit(

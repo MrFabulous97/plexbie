@@ -11,6 +11,19 @@ from core.logging import get_logger
 logger = get_logger(__name__)
 
 
+def secure_equals(provided: Optional[str], expected: Optional[str]) -> bool:
+    """Constant-time comparison of two secrets supplied as text.
+
+    hmac.compare_digest refuses str arguments containing non-ASCII characters
+    (it raises TypeError), so a request carrying a single non-ASCII byte in an
+    auth header would otherwise crash the handler and return 500 instead of 401.
+    Compare the UTF-8 bytes instead, which is defined for all input.
+    """
+    if provided is None or expected is None:
+        return False
+    return hmac.compare_digest(provided.encode("utf-8"), expected.encode("utf-8"))
+
+
 class WebhookValidator:
     """Validates webhook signatures from various services"""
 
@@ -52,10 +65,16 @@ class WebhookValidator:
             return self._validate_overseerr_signature(request, body, secret)
         elif service == "plex":
             return self._validate_plex_signature(request, body, secret)
+        elif service == "bazarr":
+            return self._validate_shared_secret(request, body, secret, service)
         else:
-            # Unknown service, allow passthrough
-            logger.warning(f"Unknown webhook service: {service}")
-            return True, None, body
+            # A secret is configured but we have no validator for this service.
+            # Fail closed: silently accepting would defeat the operator's intent.
+            logger.error(
+                f"Webhook secret configured for unknown service '{service}' - "
+                f"rejecting request because it cannot be validated"
+            )
+            return False, "Unvalidatable service", None
 
     def _get_secret(self, service: str) -> Optional[str]:
         """Get webhook secret for a service from config"""
@@ -65,8 +84,41 @@ class WebhookValidator:
             "tautulli": getattr(self.config, "tautulli_webhook_secret", None),
             "overseerr": getattr(self.config, "overseerr_webhook_secret", None),
             "plex": getattr(self.config, "plex_webhook_secret", None),
+            "bazarr": getattr(self.config, "bazarr_webhook_secret", None),
         }
         return secret_map.get(service)
+
+    def _validate_shared_secret(
+        self,
+        request: web.Request,
+        body: bytes,
+        secret: str,
+        service: str
+    ) -> Tuple[bool, Optional[str], Optional[bytes]]:
+        """Validate a service that has no native webhook auth.
+
+        Such services (Bazarr) can only carry a secret in the webhook URL or a
+        static header, so accept either. Configure the notification URL as
+        ``/webhook/<service>?secret=<value>``.
+        """
+        auth_header = request.headers.get("X-Webhook-Secret") or request.headers.get("Authorization")
+        if auth_header:
+            if auth_header.startswith("Bearer "):
+                auth_header = auth_header[7:]
+            if secure_equals(auth_header, secret):
+                return True, None, body
+            logger.warning(f"{service.title()} webhook: Invalid secret header")
+            return False, "Invalid secret", None
+
+        query_secret = request.query.get("secret")
+        if query_secret:
+            if secure_equals(query_secret, secret):
+                return True, None, body
+            logger.warning(f"{service.title()} webhook: Invalid query secret")
+            return False, "Invalid secret", None
+
+        logger.warning(f"{service.title()} webhook: No authentication found")
+        return False, "Missing authentication", None
 
     def _validate_arr_signature(
         self,
@@ -84,7 +136,7 @@ class WebhookValidator:
         api_key = request.headers.get("X-Api-Key")
         
         if api_key:
-            if hmac.compare_digest(api_key, secret):
+            if secure_equals(api_key, secret):
                 return True, None, body
             else:
                 logger.warning(f"{service.title()} webhook: Invalid API key")
@@ -97,7 +149,7 @@ class WebhookValidator:
             expected = hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
             sig_value = signature.replace("sha256=", "")
             
-            if hmac.compare_digest(sig_value, expected):
+            if secure_equals(sig_value, expected):
                 return True, None, body
             else:
                 logger.warning(f"{service.title()} webhook: Invalid signature")
@@ -131,7 +183,7 @@ class WebhookValidator:
             if auth_header.startswith("Bearer "):
                 auth_header = auth_header[7:]
             
-            if hmac.compare_digest(auth_header, secret):
+            if secure_equals(auth_header, secret):
                 return True, None, body
             else:
                 logger.warning("Tautulli webhook: Invalid signature/secret")
@@ -140,7 +192,7 @@ class WebhookValidator:
         # Check query parameter as fallback
         query_secret = request.query.get("secret")
         if query_secret:
-            if hmac.compare_digest(query_secret, secret):
+            if secure_equals(query_secret, secret):
                 return True, None, body
             else:
                 logger.warning("Tautulli webhook: Invalid query secret")
@@ -169,7 +221,7 @@ class WebhookValidator:
             else:
                 token = auth_header
             
-            if hmac.compare_digest(token, secret):
+            if secure_equals(token, secret):
                 return True, None, body
             else:
                 logger.warning("Overseerr webhook: Invalid authorization")
@@ -190,17 +242,20 @@ class WebhookValidator:
         Plex webhooks include the Plex token, which we can validate.
         """
         plex_token = request.query.get("token") or request.headers.get("X-Plex-Token")
-        
+
         if plex_token:
-            if hmac.compare_digest(plex_token, secret):
+            if secure_equals(plex_token, secret):
                 return True, None, body
             else:
                 logger.warning("Plex webhook: Invalid token")
                 return False, "Invalid token", None
 
-        # For Plex, allow unauthenticated if on trusted network
-        logger.debug("Plex webhook: No token provided, allowing (configure secret to require auth)")
-        return True, None, body
+        # Fail closed. This branch is only reached when a secret IS configured,
+        # and previously returned True - meaning an attacker bypassed validation
+        # simply by omitting the token. If no secret is configured,
+        # validate_request short-circuits before ever calling this.
+        logger.warning("Plex webhook: No token provided but a secret is configured")
+        return False, "Missing token", None
 
 
 def create_validated_handler(original_handler, validator: WebhookValidator, service: str):
