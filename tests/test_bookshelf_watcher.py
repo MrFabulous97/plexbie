@@ -253,3 +253,36 @@ def test_process_item_reports_success():
     source = inspect.getsource(module.process_item)
     assert "return False" in source, "giving up must be distinguishable from success"
     assert "return True" in source
+
+
+# --- scheduled hint expiry (independent of whether an item is processed) ---
+
+def test_expire_stale_hints_removes_only_old_ones():
+    from plugins.bookshelf_processor.cog import _expire_stale_hints
+
+    watch = _tmpdir()
+    old = _write_hint(watch, "Ancient Download", age_days=HINT_MAX_AGE_DAYS + 30)
+    fresh = _write_hint(watch, "Todays Download", age_days=0)
+
+    assert _expire_stale_hints(watch) == 1
+    assert not old.exists()
+    assert fresh.exists()
+
+
+def test_expire_stale_hints_on_empty_dir_is_a_noop():
+    from plugins.bookshelf_processor.cog import _expire_stale_hints
+
+    assert _expire_stale_hints(_tmpdir()) == 0
+
+
+def test_expire_runs_even_when_no_items_are_present():
+    """The live audiobooks dir held two orphaned hints and no items at all, so
+    expiry driven only by process_item would never have reached them.
+    """
+    import inspect
+
+    from plugins.bookshelf_processor.cog import BookshelfProcessorCog
+
+    # scan_loop is a discord.ext.tasks.Loop, so reach through to its coroutine.
+    source = inspect.getsource(BookshelfProcessorCog.scan_loop.coro)
+    assert "_expire_stale_hints" in source

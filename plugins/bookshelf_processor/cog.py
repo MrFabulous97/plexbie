@@ -1062,6 +1062,32 @@ def _normalise_for_match(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", value.lower())
 
 
+def _expire_stale_hints(watch_dir: Path) -> int:
+    """Blocking: delete hint files older than HINT_MAX_AGE_DAYS. Returns the count.
+
+    A hint is written when a download is submitted and removed when it is
+    consumed, so one that outlives its download stays forever. Sweeping on a
+    schedule (rather than only when an item is processed) means a watch directory
+    that sits empty still gets tidied.
+    """
+    removed = 0
+    cutoff = datetime.now().timestamp() - HINT_MAX_AGE_DAYS * 86400
+    for candidate in watch_dir.glob(".plexbie_hint_*.json"):
+        try:
+            mtime = candidate.stat().st_mtime
+            if mtime >= cutoff:
+                continue
+            age_days = (datetime.now().timestamp() - mtime) / 86400
+            candidate.unlink()
+            removed += 1
+            logger.info(
+                f"Removed stale hint file ({age_days:.0f} days old): {candidate.name}"
+            )
+        except OSError as e:
+            logger.debug(f"Could not expire hint {candidate.name}: {e}")
+    return removed
+
+
 def _find_hint_file(watch_dir: Path, item_name: str):
     """Locate the hint file belonging to `item_name`, expiring stale ones.
 
@@ -1518,6 +1544,11 @@ class BookshelfProcessorCog(commands.Cog):
         ]:
             if not watch_dir.exists():
                 continue
+
+            # Expire stale hints here rather than only when an item happens to be
+            # processed in this directory - orphaned hints outlive the download
+            # they were written for, and a watch dir can sit empty for months.
+            await run_blocking(_expire_stale_hints, watch_dir)
 
             for path in await run_blocking(lambda d=watch_dir: list(d.iterdir())):
                 if path.name.startswith("."):
