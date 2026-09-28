@@ -2,7 +2,7 @@
 import json
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from database.kv_store import kv_get, kv_set, kv_get_all
+from database.kv_store import kv_get, kv_set_many, kv_get_all
 from typing import Optional, Dict, Any
 
 import discord
@@ -272,7 +272,7 @@ class UserMgmtCog(commands.Cog):
 
             # Check each pending invite. The 'linked' and missing-email cases are
             # already excluded by the `pending` filter above.
-            linked_count = 0
+            linked_keys = []
             for discord_id_str, invite_data in list(pending.items()):
                 invite_email = invite_data['email'].lower()
 
@@ -343,13 +343,18 @@ class UserMgmtCog(commands.Cog):
                     # Mark invite as linked
                     invites[discord_id_str]['status'] = 'linked'
                     invites[discord_id_str]['plex_username'] = plex_username
-                    linked_count += 1
+                    linked_keys.append(discord_id_str)
 
-            # Save updated invites to database
-            if linked_count > 0:
-                for discord_id_str, invite_data in invites.items():
-                    await kv_set(INVITES_NAMESPACE, discord_id_str, invite_data)
-                logger.info(f"Auto-linked {linked_count} user(s)")
+            # Write back only the invites that changed, in one transaction. This
+            # used to rewrite every invite in the namespace whenever a single one
+            # linked - a separate transaction and fsync each, almost all of them
+            # writing back bytes that were already there.
+            if linked_keys:
+                await kv_set_many(
+                    INVITES_NAMESPACE,
+                    {key: invites[key] for key in linked_keys},
+                )
+                logger.info(f"Auto-linked {len(linked_keys)} user(s)")
 
         except Exception as e:
             logger.error(f"Error in auto_link_users: {e}", exc_info=True)

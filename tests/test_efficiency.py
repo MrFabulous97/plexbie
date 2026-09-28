@@ -779,3 +779,163 @@ def test_a_failed_plex_removal_keeps_the_tracking_row():
         "returning anything truthy here would delete the row while the user still "
         "has Plex access, with no record left to retry against"
     )
+
+
+# ===================================================================
+# 8. Bulk key-value writes go in one transaction
+# ===================================================================
+
+def _kv_set_in_loops():
+    """Awaited kv_set / kv_delete calls that sit inside a loop."""
+    for rel, text in _source_files():
+        for node in ast.walk(ast.parse(text)):
+            if not isinstance(node, (ast.For, ast.AsyncFor, ast.While)):
+                continue
+            for inner in ast.walk(node):
+                if not isinstance(inner, ast.Await) or not isinstance(inner.value, ast.Call):
+                    continue
+                func = inner.value.func
+                name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
+                if name in ("kv_set", "kv_delete"):
+                    yield f"{rel}:{inner.lineno} ({name}() in loop at line {node.lineno})"
+
+
+def test_no_per_key_kv_writes_in_a_loop():
+    """A commit is an fsync, so N keys must not mean N transactions.
+
+    new_media_added saved every tracked batch one key at a time whenever any
+    single batch changed, and auto_link_users rewrote the entire invite namespace
+    when one invite linked - most of those writes byte-identical to what was
+    already stored. Use kv_set_many.
+    """
+    offenders = sorted(set(_kv_set_in_loops()))
+    assert offenders == [], (
+        "batch these with kv_set_many instead of one transaction per key:\n  "
+        + "\n  ".join(offenders)
+    )
+
+
+def test_save_tracking_data_writes_every_batch_in_one_call():
+    from plugins.new_media_added import cog as module
+
+    calls = []
+
+    async def fake_set_many(namespace, items):
+        calls.append((namespace, dict(items)))
+
+    class FakeBatch:
+        def __init__(self, name):
+            self.name = name
+
+        def to_dict(self):
+            return {"show": self.name}
+
+    cog = object.__new__(module.NewMediaAddedCog)
+    cog.active_batches = {"a:s1": FakeBatch("A"), "b:s2": FakeBatch("B")}
+
+    original = module.kv_set_many
+    module.kv_set_many = fake_set_many
+    try:
+        asyncio.run(module.NewMediaAddedCog.save_tracking_data(cog))
+    finally:
+        module.kv_set_many = original
+
+    assert len(calls) == 1, f"expected one batched write, got {len(calls)}"
+    namespace, items = calls[0]
+    assert namespace == module.NEW_MEDIA_NAMESPACE
+    assert items == {"a:s1": {"show": "A"}, "b:s2": {"show": "B"}}
+
+
+def test_auto_link_writes_only_the_invites_that_changed():
+    """One invite linking must not rewrite every other invite in the namespace.
+
+    Uses a real temporary database: the link itself opens a session, and an
+    earlier version of this test let that fail into auto_link_users' except
+    clause - which left `written` empty and made every assertion below vacuous.
+    """
+    import tempfile as _tempfile
+
+    from plugins.user_mgmt import cog as module
+    import database.session as session_module
+
+    invites = {
+        "1": {"status": "linked", "email": "already@example.com"},
+        "2": {"status": "pending", "email": "new@example.com"},
+        "3": {"status": "pending", "email": "absent@example.com"},
+    }
+
+    written = []
+
+    async def fake_set_many(namespace, items):
+        written.append((namespace, dict(items)))
+
+    class FakeResponse:
+        status = 200
+
+        async def json(self):
+            # Only invite "2" has a matching Tautulli account.
+            return {"response": {"data": [
+                {"email": "new@example.com", "friendly_name": "newuser", "user_id": 7},
+            ]}}
+
+    class FakeCM:
+        async def __aenter__(self):
+            return FakeResponse()
+
+        async def __aexit__(self, *exc):
+            return False
+
+    class FakeTautulli:
+        async def get(self, url, params=None, **kwargs):
+            return FakeCM()
+
+    class FakeApi:
+        tautulli = FakeTautulli()
+
+    class FakeConfig:
+        tautulli_url = "http://tautulli.local"
+        tautulli_token = "token"
+        guild_id = 1
+
+    class FakeServices:
+        config = FakeConfig()
+        api = FakeApi()
+
+    cog = object.__new__(module.UserMgmtCog)
+    cog.services = FakeServices()
+    cog.bot = None  # get_guild raises AttributeError, which the cog already handles
+
+    async def fake_kv_get_all(namespace):
+        return invites
+
+    db_path = pathlib.Path(_tempfile.mkdtemp()) / "autolink.db"
+
+    async def scenario():
+        if session_module.engine is not None:
+            await session_module.engine.dispose()
+        await session_module.init_database(f"sqlite:///{db_path}")
+        try:
+            await module.UserMgmtCog.auto_link_users.coro(cog)
+        finally:
+            await session_module.engine.dispose()
+
+    original_get_all = module.kv_get_all
+    original_set_many = module.kv_set_many
+    module.kv_get_all = fake_kv_get_all
+    module.kv_set_many = fake_set_many
+    try:
+        asyncio.run(scenario())
+    finally:
+        module.kv_get_all = original_get_all
+        module.kv_set_many = original_set_many
+
+    assert len(written) == 1, (
+        f"expected exactly one batched write, got {len(written)} - if zero, the "
+        f"link failed and auto_link_users swallowed it, making this test vacuous"
+    )
+    _, items = written[0]
+    assert set(items) == {"2"}, (
+        f"only the invite that linked should be written back; got {sorted(items)}"
+    )
+    assert items["2"]["status"] == "linked"
+    assert items["2"]["plex_username"] == "newuser"

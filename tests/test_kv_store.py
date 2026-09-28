@@ -251,3 +251,172 @@ def test_reads_survive_duplicates_even_without_the_index():
 
     assert asyncio.run(scenario()) == {"generation": "newest"}
     assert _index_count(path) == 0, "test must exercise the no-index path"
+
+
+# --- batched writes: one transaction, not one per key ---
+
+def test_set_many_writes_every_key():
+    from database.kv_store import kv_get_all, kv_set_many
+
+    path = _tmp_db("setmany.db")
+
+    async def scenario():
+        await _init(path)
+        await kv_set_many("ns", {"a": 1, "b": {"nested": True}, "c": [1, 2]})
+        result = await kv_get_all("ns")
+        await _dispose()
+        return result
+
+    assert asyncio.run(scenario()) == {"a": 1, "b": {"nested": True}, "c": [1, 2]}
+
+
+def test_set_many_updates_each_row_with_its_own_value():
+    """The upsert must use excluded.value, not one literal for every row."""
+    from database.kv_store import kv_get_all, kv_set_many
+
+    path = _tmp_db("setmany_update.db")
+
+    async def scenario():
+        await _init(path)
+        await kv_set_many("ns", {"a": "first", "b": "second"})
+        await kv_set_many("ns", {"a": "updated-a", "b": "updated-b"})
+        result = await kv_get_all("ns")
+        await _dispose()
+        return result
+
+    assert asyncio.run(scenario()) == {"a": "updated-a", "b": "updated-b"}
+
+
+def test_set_many_does_not_duplicate_rows():
+    from database.kv_store import kv_set_many
+
+    path = _tmp_db("setmany_dupes.db")
+
+    async def scenario():
+        await _init(path)
+        for _ in range(3):
+            await kv_set_many("ns", {"a": 1, "b": 2})
+        await _dispose()
+
+    asyncio.run(scenario())
+    assert _row_count(path, "ns", "a") == 1
+    assert _row_count(path, "ns", "b") == 1
+
+
+def test_set_many_is_one_transaction():
+    """A commit on SQLite is an fsync, so N keys must not cost N commits."""
+    from database.kv_store import kv_set_many
+
+    path = _tmp_db("setmany_txn.db")
+    commits = {"count": 0}
+
+    async def scenario():
+        await _init(path)
+
+        import database.kv_store as module
+        from sqlalchemy.ext.asyncio import AsyncSession
+
+        real_commit = AsyncSession.commit
+
+        async def counting_commit(self):
+            commits["count"] += 1
+            return await real_commit(self)
+
+        AsyncSession.commit = counting_commit
+        try:
+            await kv_set_many("ns", {f"k{i}": i for i in range(10)})
+        finally:
+            AsyncSession.commit = real_commit
+        await _dispose()
+
+    asyncio.run(scenario())
+    # get_session commits on exit as well as the explicit commit inside, so the
+    # ceiling is what matters: it must not scale with the number of keys.
+    assert commits["count"] <= 2, (
+        f"10 keys took {commits['count']} commits; the write is still per-key"
+    )
+
+
+def test_set_many_of_nothing_is_a_no_op():
+    from database.kv_store import kv_set_many
+
+    path = _tmp_db("setmany_empty.db")
+
+    async def scenario():
+        await _init(path)
+        await kv_set_many("ns", {})
+        await _dispose()
+
+    asyncio.run(scenario())
+    with sqlite3.connect(path) as con:
+        assert con.execute("SELECT COUNT(*) FROM key_value_store").fetchone()[0] == 0
+def test_set_many_works_without_the_unique_index():
+    """The fallback path must still write every key, and still in one transaction.
+
+    Getting a database into that state takes care. create_all builds the table
+    with its UniqueConstraint, whose auto-index satisfies ON CONFLICT on its own -
+    so dropping the migration's named index is not enough, and an earlier version
+    of this test passed via the upsert while claiming to cover the fallback. The
+    table therefore has to pre-exist in the legacy shape, as it does on a database
+    written before the constraint was added.
+    """
+    from database.kv_store import kv_get_all, kv_set_many
+
+    path = _tmp_db("setmany_legacy.db")
+    with sqlite3.connect(path) as con:
+        con.execute(LEGACY_SCHEMA)
+        con.execute(
+            "INSERT INTO key_value_store (namespace, key, value) "
+            "VALUES ('ns','a','\"old\"')"
+        )
+
+    warnings = []
+    commits = {"count": 0}
+
+    async def scenario():
+        await _init(path)
+
+        # The migration re-adds the named index; drop it so nothing satisfies
+        # ON CONFLICT and the fallback is genuinely taken.
+        with sqlite3.connect(path) as con:
+            con.execute("DROP INDEX IF EXISTS " + UNIQUE_INDEX)
+            con.commit()
+
+        import database.kv_store as module
+        from sqlalchemy.ext.asyncio import AsyncSession
+
+        real_warning = module.logger.warning
+        real_commit = AsyncSession.commit
+
+        def capture(message, *args, **kwargs):
+            warnings.append(str(message))
+            return real_warning(message, *args, **kwargs)
+
+        async def counting_commit(self):
+            commits["count"] += 1
+            return await real_commit(self)
+
+        module.logger.warning = capture
+        AsyncSession.commit = counting_commit
+        try:
+            await kv_set_many("ns", {"a": "new", "b": "added"})
+        finally:
+            module.logger.warning = real_warning
+            AsyncSession.commit = real_commit
+
+        result = await kv_get_all("ns")
+        await _dispose()
+        return result
+
+    result = asyncio.run(scenario())
+
+    assert _index_count(path) == 0, "test must exercise the no-index path"
+    assert any("falling back" in w for w in warnings), (
+        f"the fallback never ran, so this test proves nothing; warnings: {warnings}"
+    )
+    assert result == {"a": "new", "b": "added"}, (
+        "the fallback must update the existing key and insert the new one"
+    )
+    assert commits["count"] <= 3, (
+        f"the fallback took {commits['count']} commits for 2 keys; it must batch too"
+    )

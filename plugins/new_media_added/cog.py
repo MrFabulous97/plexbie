@@ -13,7 +13,7 @@ from utils.formatting import episode_label, season_episode
 from utils.embeds import truncate_field
 from core.logging import get_logger
 from core.services import BotServices
-from database.kv_store import kv_get, kv_set, kv_get_all
+from database.kv_store import kv_get, kv_set_many, kv_get_all
 
 logger = get_logger(__name__)
 
@@ -137,10 +137,16 @@ class NewMediaAddedCog(commands.Cog):
             logger.error(f"Error loading tracking data: {e}")
 
     async def save_tracking_data(self):
-        """Save tracking data to database"""
+        """Save tracking data to database, in one transaction.
+
+        This writes the whole namespace, so a per-key kv_set meant one transaction
+        and one fsync per tracked batch every time any single batch changed.
+        """
         try:
-            for key, batch in self.active_batches.items():
-                await kv_set(NEW_MEDIA_NAMESPACE, key, batch.to_dict())
+            await kv_set_many(
+                NEW_MEDIA_NAMESPACE,
+                {key: batch.to_dict() for key, batch in self.active_batches.items()},
+            )
         except Exception as e:
             logger.error(f"Error saving tracking data: {e}")
 
