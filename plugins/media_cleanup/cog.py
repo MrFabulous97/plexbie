@@ -207,7 +207,7 @@ class CleanupSettingsView(AdminOnlyView):
         """Show instructions for setting inactivity days"""
         embed = discord.Embed(
             title="📅 Set Inactivity Days",
-            description=f"Current: **{self.cog.config['inactivity_days']} days**\n\nTo change, use:\n`/cleanup-config inactivity_days:<number>`",
+            description=f"Current: **{self.cog.config['inactivity_days']} days**\n\nTo change, use:\n`/cleanup config inactivity_days:<number>`",
             color=discord.Color.blue()
         )
         await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -223,7 +223,7 @@ class CleanupSettingsView(AdminOnlyView):
 
         embed = discord.Embed(
             title="📢 Set Notification Channel",
-            description=f"Current: {current_channel}\n\nTo change, use:\n`/cleanup-config notification_channel:#your-channel`",
+            description=f"Current: {current_channel}\n\nTo change, use:\n`/cleanup config notification_channel:#your-channel`",
             color=discord.Color.blue()
         )
         await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -231,6 +231,21 @@ class CleanupSettingsView(AdminOnlyView):
 
 class MediaCleanupCog(commands.Cog):
     """Handle automatic cleanup of unwatched media"""
+
+    #: One top-level /cleanup entry instead of five. Discord applies
+    #: default_member_permissions at the top level only, and every subcommand here
+    #: is admin-only, so the gate belongs on the group.
+    cleanup = app_commands.Group(
+        name="cleanup",
+        description="Manage automatic cleanup of unwatched media",
+        default_permissions=discord.Permissions(administrator=True),
+        guild_only=True,
+    )
+    exempt = app_commands.Group(
+        name="exempt",
+        description="Media exempt from automatic cleanup",
+        parent=cleanup,
+    )
 
     def __init__(self, bot: commands.Bot, services: BotServices):
         self.bot = bot
@@ -968,7 +983,7 @@ class MediaCleanupCog(commands.Cog):
                         inline=False
                     )
 
-            embed.set_footer(text=f"Use /cleanup-config to adjust settings")
+            embed.set_footer(text=f"Use /cleanup config to adjust settings")
             await channel.send(embed=embed)
 
         except Exception as e:
@@ -1115,7 +1130,7 @@ class MediaCleanupCog(commands.Cog):
         await interaction.followup.send(embed=summary_embed, ephemeral=True)
         logger.info(f"Cleanup scan complete. Notified: {len(items_to_notify)}, Deleted: {len(deleted_items)}")
 
-    @app_commands.command(name="cleanup-exempt-add", description="Exempt a movie or show from automatic cleanup")
+    @exempt.command(name="add", description="Exempt a movie or show from automatic cleanup")
     @app_commands.describe(
         title="Movie or show title to exempt",
         media_type="Limit the search to movies or shows"
@@ -1180,7 +1195,7 @@ class MediaCleanupCog(commands.Cog):
         await interaction.response.send_message(embed=embed, ephemeral=True)
         logger.info(f"{interaction.user} exempted media from cleanup: {match['title']} ({match['type']}) [{match['rating_key']}]")
 
-    @app_commands.command(name="cleanup-exempt-remove", description="Remove a cleanup exemption from a movie or show")
+    @exempt.command(name="remove", description="Remove a cleanup exemption from a movie or show")
     @app_commands.describe(title="Movie or show title to remove from the exemption list")
     async def cleanup_exempt_remove(self, interaction: discord.Interaction, title: str):
         """Remove a specific media item from the cleanup exemption list"""
@@ -1233,7 +1248,7 @@ class MediaCleanupCog(commands.Cog):
         await interaction.response.send_message(embed=embed, ephemeral=True)
         logger.info(f"{interaction.user} removed cleanup exemption: {data.get('title', 'Unknown')} ({data.get('type', 'unknown')}) [{rating_key}]")
 
-    @app_commands.command(name="cleanup-exempt-list", description="List media currently exempt from automatic cleanup")
+    @exempt.command(name="list", description="List media currently exempt from automatic cleanup")
     async def cleanup_exempt_list(self, interaction: discord.Interaction):
         """List the current cleanup exemption entries"""
         if not await require_admin(interaction):
@@ -1271,7 +1286,7 @@ class MediaCleanupCog(commands.Cog):
 
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
-    @app_commands.command(name="cleanup", description="Media cleanup control panel (Admin only)")
+    @cleanup.command(name="panel", description="Media cleanup control panel")
     async def cleanup_panel(self, interaction: discord.Interaction):
         """Show the interactive cleanup control panel"""
         if not await require_admin(interaction):
@@ -1304,7 +1319,7 @@ class MediaCleanupCog(commands.Cog):
 
         await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
-    @app_commands.command(name="cleanup-config", description="Configure cleanup settings (Admin only)")
+    @cleanup.command(name="config", description="Configure cleanup settings")
     @app_commands.describe(
         inactivity_days="Number of days before media is considered inactive",
         notification_channel="Channel to send cleanup notifications"

@@ -200,7 +200,9 @@ class InviteTrackerCog(commands.Cog):
 
         return any(role.id == admin_role_id for role in member.roles)
 
-    @app_commands.command(name="who-invited", description="Check who invited a specific user (Admin only)")
+    @app_commands.command(name="who-invited", description="Check who invited a specific user")
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.guild_only()
     @app_commands.describe(member="The member to check")
     async def who_invited(self, interaction: discord.Interaction, member: discord.Member):
         """Check who invited a specific member - Admin only"""

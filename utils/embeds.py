@@ -89,7 +89,7 @@ def truncate_field(text: str, limit: int = MAX_FIELD_VALUE, suffix: str = "\n…
 
     Discord rejects a field value over 1024 characters with HTTPException 400,
     which callers surface as a generic error - so an over-long list makes a command
-    look broken exactly when it has the most to report. /cleanup-plex-users hit
+    look broken exactly when it has the most to report. the Plex account listing hit
     this: ten entries describing over-long usernames came to roughly 2068
     characters.
     """

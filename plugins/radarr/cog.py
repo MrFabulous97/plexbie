@@ -13,7 +13,7 @@ class RadarrCog(commands.Cog):
         self.bot = bot
         self.services = services
     
-    radarr_group = app_commands.Group(name="radarr", description="Movie management")
+    radarr_group = app_commands.Group(name="radarr", description="Movie management", guild_only=True)
     
     @radarr_group.command(name="search", description="Search for movies")
     async def radarr_search(self, interaction: discord.Interaction, movie: str):

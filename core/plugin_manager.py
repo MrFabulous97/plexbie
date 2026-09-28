@@ -101,6 +101,15 @@ class PluginManager:
             else:
                 logger.warning(f"⚠️  Plugin {plugin_name}: No cog class found")
                 
+        except discord.app_commands.CommandAlreadyRegistered as e:
+            # Two plugins claiming the same top-level command name. The generic
+            # message below says only "Failed to load plugin X", which sends you
+            # looking for a bug in X rather than at the name it collides with.
+            logger.error(
+                f"Plugin {plugin_name} was not loaded: it defines the command "
+                f"/{e.name}, which another loaded plugin already registered. "
+                f"Rename one of them, or enable only one of the two."
+            )
         except Exception as e:
             logger.error(f"Failed to load plugin {plugin_name}: {e}", exc_info=e)
     

@@ -1645,6 +1645,7 @@ class MediaRequestsCog(commands.Cog):
         logger.info("✅ Registered persistent media/book approval views")
 
     @app_commands.command(name="request", description="Request media (TV, Movie, Audiobook, or Ebook)")
+    @app_commands.guild_only()
     async def request_media(self, interaction: discord.Interaction):
         """Start media request flow — choose media type first"""
         view = MediaTypeSelectView(cog=self, user_id=interaction.user.id)

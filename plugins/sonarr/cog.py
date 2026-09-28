@@ -13,7 +13,7 @@ class SonarrCog(commands.Cog):
         self.bot = bot
         self.services = services
     
-    sonarr_group = app_commands.Group(name="sonarr", description="TV show management")
+    sonarr_group = app_commands.Group(name="sonarr", description="TV show management", guild_only=True)
     
     @sonarr_group.command(name="search", description="Search for TV shows")
     async def sonarr_search(self, interaction: discord.Interaction, show: str):

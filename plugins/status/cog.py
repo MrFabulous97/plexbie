@@ -41,6 +41,7 @@ class StatusCog(commands.Cog):
         self.services = services
     
     @app_commands.command(name="status", description="Check Plex server status")
+    @app_commands.guild_only()
     async def plex_status(self, interaction: discord.Interaction):
         """Display Plex server status and statistics"""
         await interaction.response.defer()
@@ -125,7 +126,9 @@ class StatusCog(commands.Cog):
             )
             await interaction.followup.send(embed=embed, ephemeral=True)
 
-    @app_commands.command(name="say", description="Make Plexbie send a message (Admin only)")
+    @app_commands.command(name="say", description="Make Plexbie send a message")
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.guild_only()
     @app_commands.describe(
         channel="The channel to send the message to",
         message="The message content"

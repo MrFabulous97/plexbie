@@ -13,7 +13,7 @@ class LidarrCog(commands.Cog):
         self.bot = bot
         self.services = services
     
-    lidarr_group = app_commands.Group(name="lidarr", description="Music management")
+    lidarr_group = app_commands.Group(name="lidarr", description="Music management", guild_only=True)
     
     @lidarr_group.command(name="search", description="Search for music")
     async def lidarr_search(self, interaction: discord.Interaction, artist: str):

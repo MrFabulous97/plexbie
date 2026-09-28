@@ -47,6 +47,7 @@ class RecentlyAddedCog(commands.Cog):
         self.services = services
 
     @app_commands.command(name="recent", description="View recently added media")
+    @app_commands.guild_only()
     async def plex_recently(self, interaction: discord.Interaction):
         """Display recently added media with pagination"""
         await interaction.response.defer()

@@ -284,6 +284,7 @@ class UserInvitesCog(commands.Cog):
         
     
     @app_commands.command(name="join-plex", description="Request access to the Plex server")
+    @app_commands.guild_only()
     async def join_plex(self, interaction: discord.Interaction):
         """Request Plex access with email collection via DM"""
         logger.info(f"User {interaction.user.name} ({interaction.user.id}) invoked /join-plex")

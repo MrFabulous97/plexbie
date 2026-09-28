@@ -6,6 +6,9 @@
     "enabled": true,
     "dependencies": [],
     "commands": [
-        "/removeuser - Manually remove a user from Plex (Admin only)"
+        "/remove-user - Manually remove a user from Plex",
+        "/list-plex-users - List Plex accounts on the server, or only malformed ones",
+        "/list-tracked-users - List tracked users in the database, flagging orphans",
+        "/manage-links - Manage Discord to Plex account links"
     ]
 }

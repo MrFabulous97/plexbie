@@ -5,6 +5,7 @@ import sys
 from pathlib import Path
 
 import discord
+from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
 
@@ -46,22 +47,39 @@ class Plexbie(commands.Bot):
         async def on_app_command_error(interaction: discord.Interaction, error: Exception):
             """Global error handler for app commands"""
             command_name = interaction.command.name if interaction.command else "unknown"
-            logger.error(
-                f"App command error: /{command_name} by {interaction.user} ({interaction.user.id}) - {error}",
-                exc_info=error
-            )
 
-            # Send user-friendly error message if not already responded
-            if not interaction.response.is_done():
-                await interaction.response.send_message(
-                    "An error occurred while processing your command. Please try again later.",
-                    ephemeral=True
+            # A refused command is not a crash. These used to be logged at ERROR
+            # with a full traceback and answered with "An error occurred... try
+            # again later", which told the user nothing and made ordinary denials
+            # look like failures in the log.
+            if isinstance(error, app_commands.MissingPermissions):
+                logger.info(
+                    f"/{command_name} denied for {interaction.user} "
+                    f"({interaction.user.id}): missing permissions"
                 )
+                message = "You don't have permission to use this command."
+            elif isinstance(error, app_commands.NoPrivateMessage):
+                logger.info(f"/{command_name} attempted in a DM by {interaction.user}")
+                message = "This command only works inside a server."
+            elif isinstance(error, app_commands.CommandOnCooldown):
+                logger.info(f"/{command_name} on cooldown for {interaction.user}")
+                message = f"That command is on cooldown - try again in {error.retry_after:.0f}s."
             else:
-                await interaction.followup.send(
-                    "An error occurred while processing your command. Please try again later.",
-                    ephemeral=True
+                logger.error(
+                    f"App command error: /{command_name} by {interaction.user} "
+                    f"({interaction.user.id}) - {error}",
+                    exc_info=error,
                 )
+                message = "An error occurred while processing your command. Please try again later."
+
+            try:
+                if not interaction.response.is_done():
+                    await interaction.response.send_message(message, ephemeral=True)
+                else:
+                    await interaction.followup.send(message, ephemeral=True)
+            except discord.HTTPException as e:
+                # The interaction may have expired; nothing more to do than note it.
+                logger.debug(f"Could not deliver error message for /{command_name}: {e}")
 
         # Load all plugins (they can now register webhook routes)
         await self.plugin_manager.load_all_plugins()
@@ -84,16 +102,36 @@ class Plexbie(commands.Bot):
         for cmd in self.tree.get_commands():
             logger.debug(f"  - {cmd.name}: {cmd.description}")
 
-        # Sync slash commands (guild-specific only, no global commands)
+        # Sync slash commands. Guild-scoped only: a guild sync is immediate,
+        # whereas global commands take up to an hour to propagate.
         if self.config.guild_id:
             guild = discord.Object(id=self.config.guild_id)
-            # Copy global commands to guild tree, then sync
             self.tree.copy_global_to(guild=guild)
-            await self.tree.sync(guild=guild)
-            logger.info(f"Commands synced to guild {self.config.guild_id}")
+            synced = await self.tree.sync(guild=guild)
+            logger.info(
+                f"Commands: {len(synced)} synced to guild {self.config.guild_id}"
+            )
+
+            # Then make sure the global scope is empty. Discord merges global and
+            # guild commands in the picker, so anything left there from an earlier
+            # global sync appears a second time - this deployment had accumulated
+            # 15 such duplicates, which nothing in the code ever removed. Cheap and
+            # idempotent: after the first cleanup fetch_commands() returns nothing.
+            try:
+                stale = await self.tree.fetch_commands()
+                if stale:
+                    logger.warning(
+                        f"Commands: removing {len(stale)} stale global command(s) "
+                        f"that duplicate the guild-scoped ones"
+                    )
+                    self.tree.clear_commands(guild=None)
+                    await self.tree.sync()
+            except discord.HTTPException as e:
+                # Not worth failing startup over; the duplicates are cosmetic.
+                logger.warning(f"Could not check for stale global commands: {e}")
         else:
-            await self.tree.sync()
-            logger.info("Commands synced globally")
+            synced = await self.tree.sync()
+            logger.info(f"Commands: {len(synced)} synced globally")
     
     async def on_ready(self):
         """Bot is ready and connected"""

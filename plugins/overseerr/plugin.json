@@ -1,13 +1,13 @@
 {
     "name": "overseerr",
     "version": "1.0.0",
-    "description": "Media requests via Overseerr",
+    "description": "Overseerr request commands (stub - not yet implemented)",
     "author": "Plexbie",
     "enabled": false,
     "dependencies": [],
     "commands": [
-        "/request movie",
-        "/request show",
-        "/request status"
+        "/overseerr movie - Request a movie",
+        "/overseerr show - Request a TV show",
+        "/overseerr status - Check request status"
     ]
 }

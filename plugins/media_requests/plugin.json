@@ -6,7 +6,6 @@
     "enabled": true,
     "dependencies": [],
     "commands": [
-        "/request",
-        "/requests"
+        "/request - Request a TV show, movie, audiobook or ebook"
     ]
 }

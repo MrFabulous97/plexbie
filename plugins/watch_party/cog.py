@@ -447,6 +447,7 @@ class WatchPartyCog(commands.Cog):
     # ==================== Slash Commands ====================
 
     @app_commands.command(name="watchparty-stats", description="View your watch party statistics")
+    @app_commands.guild_only()
     async def watchparty_stats(self, interaction: discord.Interaction):
         """Show user's watch party statistics"""
         await interaction.response.defer(ephemeral=True)
@@ -498,7 +499,9 @@ class WatchPartyCog(commands.Cog):
             logger.error(f"Error showing watchparty stats: {e}")
             await interaction.followup.send("Error retrieving stats.", ephemeral=True)
 
-    @app_commands.command(name="watchparty-active", description="Show active watch party (Admin)")
+    @app_commands.command(name="watchparty-active", description="Show active watch party")
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.guild_only()
     @app_commands.checks.has_permissions(administrator=True)
     async def watchparty_active(self, interaction: discord.Interaction):
         """Admin command to view active watch party"""

@@ -13,7 +13,7 @@ class TautulliCog(commands.Cog):
         self.bot = bot
         self.services = services
     
-    stats_group = app_commands.Group(name="stats", description="Server statistics")
+    stats_group = app_commands.Group(name="stats", description="Server statistics", guild_only=True)
     
     @stats_group.command(name="history", description="View watch history")
     async def stats_history(self, interaction: discord.Interaction):

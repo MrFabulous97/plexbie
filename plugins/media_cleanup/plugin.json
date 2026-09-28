@@ -6,9 +6,10 @@
     "enabled": true,
     "dependencies": [],
     "commands": [
-        "/cleanup - Interactive control panel with clickable buttons",
-        "/cleanup-exempt-add - Exempt a specific movie or show from automatic cleanup",
-        "/cleanup-exempt-remove - Remove a cleanup exemption for a specific movie or show",
-        "/cleanup-exempt-list - List all media currently exempt from automatic cleanup"
+        "/cleanup panel - Interactive control panel with clickable buttons",
+        "/cleanup config - Configure inactivity thresholds and notification channel",
+        "/cleanup exempt add - Exempt a specific movie or show from automatic cleanup",
+        "/cleanup exempt remove - Remove a cleanup exemption for a specific movie or show",
+        "/cleanup exempt list - List all media currently exempt from automatic cleanup"
     ]
 }

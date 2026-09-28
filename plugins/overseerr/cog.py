@@ -13,7 +13,11 @@ class OverseerrCog(commands.Cog):
         self.bot = bot
         self.services = services
     
-    request_group = app_commands.Group(name="request", description="Media requests")
+    # Named for the service, not the verb: media_requests already owns the
+    # top-level /request command, and two plugins cannot claim the same name.
+    request_group = app_commands.Group(
+        name="overseerr", description="Overseerr requests", guild_only=True
+    )
     
     @request_group.command(name="movie", description="Request a movie")
     async def request_movie(self, interaction: discord.Interaction, title: str):

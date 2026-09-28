@@ -15,6 +15,7 @@ class SearchCog(commands.Cog):
         self.services = services
     
     @app_commands.command(name="search", description="Search Plex libraries")
+    @app_commands.guild_only()
     @app_commands.describe(
         query="Search query",
         media_type="Type of media to search"

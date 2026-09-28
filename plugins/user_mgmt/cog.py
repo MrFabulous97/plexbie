@@ -600,7 +600,9 @@ class UserMgmtCog(commands.Cog):
         await self.bot.wait_until_ready()
 
     # Admin command for manual removal
-    @app_commands.command(name="removeuser", description="Manually remove a user from Plex (Admin only)")
+    @app_commands.command(name="remove-user", description="Manually remove a user from Plex")
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.guild_only()
     @app_commands.describe(plex_username="The Plex username to remove")
     @app_commands.checks.has_permissions(administrator=True)
     async def remove_user(self, interaction: discord.Interaction, plex_username: str):
@@ -758,7 +760,9 @@ class UserMgmtCog(commands.Cog):
 
     # ===== User Linking System =====
 
-    @app_commands.command(name="list-tracked-users", description="List all tracked Plex users in database (Admin only)")
+    @app_commands.command(name="list-tracked-users", description="List all tracked Plex users in database")
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.guild_only()
     @app_commands.checks.has_permissions(administrator=True)
     async def list_tracked_users(self, interaction: discord.Interaction):
         """List all users being tracked in the database"""
@@ -823,7 +827,7 @@ class UserMgmtCog(commands.Cog):
                 notes.append(f"Showing first {len(shown)} of {len(tracked_users)}")
             if orphaned_count > 0:
                 notes.append(
-                    f"⚠️ {orphaned_count} not on Plex - remove with /removeuser "
+                    f"⚠️ {orphaned_count} not on Plex - remove with /remove-user "
                     f"(not cleaned up automatically)"
                 )
             if notes:
@@ -835,72 +839,127 @@ class UserMgmtCog(commands.Cog):
             logger.error(f"Error listing tracked users: {e}", exc_info=True)
             await interaction.followup.send(f"❌ Error: {str(e)}", ephemeral=True)
 
-    @app_commands.command(name="list-plex-users", description="List all Plex users (Admin only)")
+    #: Accounts never listed as needing removal. ID 1 is the server owner.
+    PROTECTED_PLEX_ACCOUNT_IDS = (1,)
+
+    @staticmethod
+    def _plex_account_problems(account) -> list:
+        """Why this Plex account is malformed, or an empty list if it is fine."""
+        problems = []
+        if not account.name or not account.name.strip():
+            problems.append("Empty/blank username")
+        elif len(account.name) > 100:
+            problems.append(f"Username too long ({len(account.name)} chars)")
+        return problems
+
+    @app_commands.command(name="list-plex-users", description="List Plex users on the server")
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.guild_only()
     @app_commands.checks.has_permissions(administrator=True)
-    async def list_plex_users(self, interaction: discord.Interaction):
-        """List all Plex users with details to find problematic accounts"""
+    @app_commands.describe(show="Which accounts to list (default: all)")
+    @app_commands.choices(show=[
+        app_commands.Choice(name="All accounts", value="all"),
+        app_commands.Choice(name="Only malformed accounts", value="invalid"),
+    ])
+    async def list_plex_users(
+        self,
+        interaction: discord.Interaction,
+        show: Optional[app_commands.Choice[str]] = None,
+    ):
+        """List Plex accounts, optionally only the malformed ones.
+
+        Replaces a separate /cleanup-plex-users command, which was a strict subset
+        of this one: both read systemAccounts and applied the same validity rules,
+        and this command already computed the invalid list in order to display it.
+        """
         await interaction.response.defer(ephemeral=True)
+
+        invalid_only = show is not None and show.value == "invalid"
 
         try:
             if not self.services.plex_server:
                 await interaction.followup.send("❌ Plex server not configured", ephemeral=True)
                 return
 
-            # Get all Plex users
             plex_users = await run_blocking(self.services.plex_server.systemAccounts)
-
-            embed = discord.Embed(
-                title="📋 All Plex Users",
-                description=f"Total: {len(plex_users)} users",
-                color=discord.Color.blue()
-            )
 
             valid_users = []
             invalid_users = []
 
             for user in plex_users:
                 user_info = f"**ID:** {user.id}\n**Name:** `{repr(user.name)}`"
-
-                # Check if valid
-                is_valid = user.name and user.name.strip() and len(user.name) <= 100
-
-                if hasattr(user, 'email') and user.email:
+                if getattr(user, "email", None):
                     user_info += f"\n**Email:** {user.email}"
 
-                if is_valid:
-                    valid_users.append(user_info)
+                problems = self._plex_account_problems(user)
+                # A protected account is reported as-is but never as one to remove:
+                # the owner account can legitimately look odd and must not be
+                # offered up for deletion.
+                if problems and user.id not in self.PROTECTED_PLEX_ACCOUNT_IDS:
+                    invalid_users.append(
+                        f"{user_info}\n⚠️ **Issues:** {', '.join(problems)}"
+                    )
                 else:
-                    issues = []
-                    if not user.name or not user.name.strip():
-                        issues.append("Empty/blank name")
-                    if user.name and len(user.name) > 100:
-                        issues.append(f"Too long ({len(user.name)} chars)")
-                    user_info += f"\n⚠️ **Issues:** {', '.join(issues)}"
-                    invalid_users.append(user_info)
+                    valid_users.append(user_info)
 
-            # Show invalid users first (if any)
+            if invalid_only:
+                if not invalid_users:
+                    await interaction.followup.send(
+                        "✅ No malformed Plex accounts found.", ephemeral=True
+                    )
+                    return
+
+                embed = discord.Embed(
+                    title="⚠️ Malformed Plex Accounts",
+                    description=(
+                        f"Found {len(invalid_users)} account(s) that should be removed.\n\n"
+                        "**Note:** system accounts cannot be deleted through the Plex "
+                        "API. Remove them in the Plex web interface:\n"
+                        "Settings → Users → [User] → Remove Access"
+                    ),
+                    color=discord.Color.orange(),
+                )
+                embed.add_field(
+                    name=f"Accounts to remove ({len(invalid_users)} total)",
+                    # Clamped: an over-long value is rejected with HTTPException
+                    # 400, which made this fail whenever it had findings - and the
+                    # long-username case is exactly what it looks for.
+                    value=truncate_field("\n\n".join(invalid_users[:10])),
+                    inline=False,
+                )
+                if len(invalid_users) > 10:
+                    embed.set_footer(
+                        text=f"Showing first 10 of {len(invalid_users)} accounts"
+                    )
+                await interaction.followup.send(embed=embed, ephemeral=True)
+                return
+
+            embed = discord.Embed(
+                title="📋 All Plex Users",
+                description=f"Total: {len(plex_users)} accounts",
+                color=discord.Color.blue(),
+            )
+
             if invalid_users:
                 embed.add_field(
-                    name="❌ Invalid Users (Should be removed)",
-                    # The "max 10 fits" assumption was wrong: entries describing
-                    # over-long usernames can exceed the 1024-char field limit.
+                    name="❌ Malformed (should be removed)",
                     value=truncate_field("\n\n".join(invalid_users[:10])),
-                    inline=False
+                    inline=False,
                 )
 
-            # Show valid users
             if valid_users:
-                # Split into chunks if too many
-                for i in range(0, min(len(valid_users), 15), 5):  # Max 15 valid users shown
-                    chunk = valid_users[i:i+5]
+                for i in range(0, min(len(valid_users), 15), 5):
+                    chunk = valid_users[i:i + 5]
                     embed.add_field(
-                        name=f"✅ Valid Users ({i+1}-{i+len(chunk)})",
+                        name=f"✅ Valid ({i + 1}-{i + len(chunk)})",
                         value=truncate_field("\n\n".join(chunk)),
-                        inline=False
+                        inline=False,
                     )
 
             if invalid_users:
-                embed.set_footer(text="Use /cleanup-plex-users to see removal instructions")
+                embed.set_footer(
+                    text="Run again with show: Only malformed accounts for removal steps"
+                )
 
             await interaction.followup.send(embed=embed, ephemeral=True)
 
@@ -908,88 +967,9 @@ class UserMgmtCog(commands.Cog):
             logger.error(f"Error listing Plex users: {e}", exc_info=True)
             await interaction.followup.send(f"❌ Error: {str(e)}", ephemeral=True)
 
-    @app_commands.command(name="cleanup-plex-users", description="List invalid Plex users for manual cleanup (Admin only)")
-    @app_commands.checks.has_permissions(administrator=True)
-    async def cleanup_plex_users(self, interaction: discord.Interaction):
-        """List invalid Plex system accounts that should be manually removed from Plex"""
-        await interaction.response.defer(ephemeral=True)
-
-        try:
-            if not self.services.plex_server:
-                await interaction.followup.send("❌ Plex server not configured", ephemeral=True)
-                return
-
-            # Get all Plex users
-            plex_users = await run_blocking(self.services.plex_server.systemAccounts)
-
-            invalid_users = []
-            protected_ids = [1]  # Protect admin account (ID 1)
-
-            for user in plex_users:
-                # Skip protected accounts
-                if user.id in protected_ids:
-                    continue
-
-                # Check if invalid
-                is_invalid = False
-                reasons = []
-
-                if not user.name or not user.name.strip():
-                    is_invalid = True
-                    reasons.append("Empty/blank username")
-
-                if user.name and len(user.name) > 100:
-                    is_invalid = True
-                    reasons.append(f"Username too long ({len(user.name)} chars)")
-
-                if is_invalid:
-                    invalid_users.append({
-                        'id': user.id,
-                        'name': repr(user.name),
-                        'reasons': reasons
-                    })
-
-            if not invalid_users:
-                await interaction.followup.send("✅ No invalid Plex users found!", ephemeral=True)
-                return
-
-            # Build result message
-            embed = discord.Embed(
-                title="⚠️ Invalid Plex Users Found",
-                description=(
-                    f"Found {len(invalid_users)} invalid user(s) that should be manually removed.\n\n"
-                    "**Note:** System accounts cannot be deleted via the Plex API. "
-                    "You must remove these users manually through the Plex web interface:\n"
-                    "Settings → Users → [User] → Remove Access"
-                ),
-                color=discord.Color.orange()
-            )
-
-            # List invalid users
-            user_list = []
-            for user in invalid_users[:10]:  # Limit to 10 to fit in embed
-                reasons_str = ", ".join(user['reasons'])
-                user_list.append(f"**ID {user['id']}:** {user['name']}\n└─ Issues: {reasons_str}")
-
-            embed.add_field(
-                name=f"Users to Remove ({len(invalid_users)} total)",
-                # Clamped: an over-long value is rejected with HTTPException 400,
-                # which made this command fail whenever it had findings - and the
-                # long-username case is exactly what it looks for.
-                value=truncate_field("\n\n".join(user_list)),
-                inline=False
-            )
-
-            if len(invalid_users) > 10:
-                embed.set_footer(text=f"Showing first 10 of {len(invalid_users)} invalid users")
-
-            await interaction.followup.send(embed=embed, ephemeral=True)
-
-        except Exception as e:
-            logger.error(f"Error listing invalid Plex users: {e}", exc_info=True)
-            await interaction.followup.send(f"❌ Error: {str(e)}", ephemeral=True)
-
-    @app_commands.command(name="manage-links", description="Manage Discord-Plex user links (Admin only)")
+    @app_commands.command(name="manage-links", description="Manage Discord-Plex user links")
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.guild_only()
     @app_commands.checks.has_permissions(administrator=True)
     async def manage_links(self, interaction: discord.Interaction):
         """Open the user link management panel"""

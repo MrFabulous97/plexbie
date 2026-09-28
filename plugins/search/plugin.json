@@ -1,11 +1,11 @@
 {
     "name": "search",
     "version": "1.0.0",
-    "description": "Search Plex libraries",
+    "description": "Search Plex libraries (stub - not yet implemented)",
     "author": "Plexbie",
     "enabled": false,
     "dependencies": [],
     "commands": [
-        "/plex search"
+        "/search - Search Plex libraries"
     ]
 }
