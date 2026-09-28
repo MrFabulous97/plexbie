@@ -97,7 +97,10 @@ class ServiceHealthCog(commands.Cog):
             # Try to use existing connection first
             if self.services.plex_server:
                 try:
-                    _ = await run_blocking(self.services.plex_server.sessions)
+                    # force=True: a liveness probe answered from cache is not a
+                    # probe. It still seeds the shared snapshot, so the polling
+                    # loops can reuse this request. See services.plex_sessions.
+                    _ = await self.services.plex_sessions(force=True)
                     return ServiceStatus.HEALTHY, None
                 except Exception as e:
                     logger.debug(f"Plex connection stale, reconnecting: {e}")
@@ -113,7 +116,10 @@ class ServiceHealthCog(commands.Cog):
                 timeout=10,
             )
 
-            # Verify connection with health check
+            # Verify the connection before publishing it. Deliberately a direct
+            # call, not services.plex_sessions(): `plex` is not yet the shared
+            # plex_server, and the whole point is to test this object rather than
+            # whatever the container currently holds.
             _ = await run_blocking(plex.sessions)
 
             # Update the shared plex_server reference

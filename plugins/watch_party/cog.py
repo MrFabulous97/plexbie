@@ -10,7 +10,6 @@ from discord import app_commands
 from discord.ext import commands, tasks
 from sqlalchemy import select, update
 
-from core.blocking import run_blocking
 from utils.formatting import episode_label
 from utils.embeds import truncate_field
 from core.logging import get_logger
@@ -124,7 +123,9 @@ class WatchPartyCog(commands.Cog):
             return None
 
         try:
-            sessions = await run_blocking(self.services.plex_server.sessions)
+            # Shared snapshot - see services.plex_sessions. While a party is
+            # running this loop and watch_tracking's both fire every 10 seconds.
+            sessions = await self.services.plex_sessions()
             for session in sessions:
                 session_user = session.usernames[0] if session.usernames else None
                 if session_user and session_user.lower() == plex_username.lower():

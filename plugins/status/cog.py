@@ -89,7 +89,9 @@ class StatusCog(commands.Cog):
                 )
             
             # Active sessions
-            sessions = await run_blocking(plex.sessions)
+            # Shared snapshot - the polling loops keep this warm, so /status
+            # usually costs no request at all. See services.plex_sessions.
+            sessions = await self.services.plex_sessions()
             embed.add_field(
                 name="Active Streams",
                 value=f"👥 {len(sessions)} user(s) streaming",

@@ -117,12 +117,11 @@ def test_now_watching_tick_issues_no_message_fetch():
             calls["fetch"] += 1
             return FakePartial()
 
-    class FakePlex:
-        def sessions(self):
-            return []
-
     class FakeServices:
-        plex_server = FakePlex()
+        plex_server = object()  # only needs to be non-None
+
+        async def plex_sessions(self, max_age=None, force=False):
+            return []
 
     cog = object.__new__(WatchTrackingCog)
     cog.services = FakeServices()
@@ -496,4 +495,169 @@ def test_media_cleanup_does_not_walk_seasons():
     assert offenders == [], (
         f"seasons() at line(s) {offenders}: use show.episodes(), which fetches "
         f"/allLeaves in a single request"
+    )
+
+
+# ===================================================================
+# 6. One sessions() snapshot, shared between the plugins that poll it
+# ===================================================================
+
+def _services_with_counting_plex():
+    """A BotServices whose Plex counts how often sessions() is actually called."""
+    from core.config import Config
+    from core.services import BotServices
+
+    calls = {"sessions": 0}
+
+    class CountingPlex:
+        def sessions(self):
+            calls["sessions"] += 1
+            return [f"session-{calls['sessions']}"]
+
+    services = BotServices(Config())
+    services.plex_server = CountingPlex()
+    return services, calls
+
+
+def test_a_second_caller_in_the_window_reuses_the_snapshot():
+    """watch_tracking and watch_party poll the same fact on the same cadence."""
+    services, calls = _services_with_counting_plex()
+
+    async def scenario():
+        first = await services.plex_sessions()
+        second = await services.plex_sessions()
+        return first, second
+
+    first, second = asyncio.run(scenario())
+    assert calls["sessions"] == 1, (
+        "each consumer issued its own request for one snapshot of who is streaming"
+    )
+    assert second == first
+
+
+def test_concurrent_callers_collapse_to_one_request():
+    """Two loops firing in the same moment is the case this exists to collapse."""
+    services, calls = _services_with_counting_plex()
+
+    async def scenario():
+        return await asyncio.gather(*(services.plex_sessions() for _ in range(4)))
+
+    results = asyncio.run(scenario())
+    assert calls["sessions"] == 1, (
+        f"{calls['sessions']} requests for 4 concurrent callers; the re-check "
+        f"under the lock is missing or ineffective"
+    )
+    assert all(r == results[0] for r in results)
+
+
+def test_a_stale_snapshot_is_refetched():
+    """Sharing must not mean serving arbitrarily old data."""
+    from core.services import PLEX_SESSIONS_MAX_AGE
+
+    services, calls = _services_with_counting_plex()
+
+    async def scenario():
+        await services.plex_sessions()
+        # Backdate the entry rather than sleeping.
+        server, fetched_at, sessions = services._sessions_cache
+        services._sessions_cache = (
+            server,
+            fetched_at - (PLEX_SESSIONS_MAX_AGE + 1),
+            sessions,
+        )
+        return await services.plex_sessions()
+
+    asyncio.run(scenario())
+    assert calls["sessions"] == 2, "a snapshot past its age must be refetched"
+
+
+def test_max_age_stays_under_the_ten_second_poll_interval():
+    """Otherwise a 10-second display could serve data older than its own period."""
+    from core.services import PLEX_SESSIONS_MAX_AGE
+
+    assert 0 < PLEX_SESSIONS_MAX_AGE < 10
+
+
+def test_a_reconnect_invalidates_the_snapshot():
+    """A new PlexServer says nothing about what the old one reported."""
+    services, calls = _services_with_counting_plex()
+
+    class OtherPlex:
+        def sessions(self):
+            return ["from-the-new-server"]
+
+    async def scenario():
+        await services.plex_sessions()
+        services.plex_server = OtherPlex()      # as service_health does on reconnect
+        return await services.plex_sessions()
+
+    result = asyncio.run(scenario())
+    assert result == ["from-the-new-server"], (
+        "the snapshot cached against the previous connection was served after a "
+        "reconnect"
+    )
+
+
+def test_force_bypasses_the_cache_but_still_fills_it():
+    """A liveness probe answered from cache is not a probe - but its result is
+    perfectly good for everyone else.
+    """
+    services, calls = _services_with_counting_plex()
+
+    async def scenario():
+        await services.plex_sessions()            # 1 - a polling loop
+        await services.plex_sessions(force=True)  # 2 - the health probe
+        await services.plex_sessions()            # reuses the probe's result
+        return None
+
+    asyncio.run(scenario())
+    assert calls["sessions"] == 2, (
+        f"expected the forced probe to fetch and then be reused; got "
+        f"{calls['sessions']} requests"
+    )
+
+
+def test_no_plex_server_raises_rather_than_reporting_an_empty_list():
+    """An empty list reads as "nobody is watching", which is a wrong answer."""
+    from core.config import Config
+    from core.services import BotServices
+
+    services = BotServices(Config())
+    services.plex_server = None
+
+    raised = False
+    try:
+        asyncio.run(services.plex_sessions())
+    except RuntimeError:
+        raised = True
+    assert raised, "a missing Plex connection must not look like an idle server"
+
+
+def test_service_health_probe_is_forced():
+    """If the probe could be answered from cache it would stop being a probe."""
+    from plugins.service_health.cog import ServiceHealthCog
+
+    source = inspect.getsource(ServiceHealthCog._check_plex)
+    assert "plex_sessions(force=True)" in source, (
+        "the health probe must not be satisfied by another plugin's snapshot"
+    )
+
+
+def test_the_polling_consumers_share_the_snapshot():
+    """Pattern: nobody should reach past the accessor to sessions() directly."""
+    offenders = []
+    for rel, text in _source_files():
+        if rel == "core/services.py":
+            continue  # the accessor itself
+        for node in ast.walk(ast.parse(text)):
+            if not isinstance(node, ast.Attribute) or node.attr != "sessions":
+                continue
+            # service_health verifies a brand-new connection before publishing it,
+            # which is deliberately not the shared one.
+            if rel == "plugins/service_health/cog.py":
+                continue
+            offenders.append(f"{rel}:{node.lineno}")
+    assert offenders == [], (
+        "call services.plex_sessions() instead of fetching sessions directly:\n  "
+        + "\n  ".join(offenders)
     )

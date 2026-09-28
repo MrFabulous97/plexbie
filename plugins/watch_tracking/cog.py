@@ -294,7 +294,9 @@ class WatchTrackingCog(commands.Cog):
             await self._refresh_username_cache()
 
             # Get active sessions
-            sessions = await run_blocking(self.services.plex_server.sessions)
+            # Shared snapshot: watch_party polls the same fact on the same 10s
+            # cadence, and service_health every 30s. See services.plex_sessions.
+            sessions = await self.services.plex_sessions()
 
             embed = discord.Embed(
                 title="📺 Now Watching on Plex",

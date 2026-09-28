@@ -1,5 +1,6 @@
 # path: core/services.py
 """Dependency injection container for bot services"""
+import asyncio
 import time
 from typing import Optional, Dict, Any, Tuple
 
@@ -15,6 +16,13 @@ from core.security import redact
 from database.session import get_session
 
 logger = get_logger(__name__)
+
+
+#: How long a sessions() snapshot may be reused. Deliberately just under the
+#: 10-second interval of the two loops that poll it, so a display never shows
+#: data older than its own refresh period while still letting a second caller in
+#: the same window reuse the first one's result.
+PLEX_SESSIONS_MAX_AGE = 8.0
 
 
 class _ServiceAPIProxy:
@@ -60,6 +68,10 @@ class BotServices:
         self.redis_client: Optional[aioredis.Redis] = None
         self.plex_server: Optional[PlexServer] = None
         self.api = _LegacyAPIClients(self)
+        # Shared snapshot of plex_server.sessions(): (server, monotonic_time,
+        # sessions). See plex_sessions() for why this is shared.
+        self._sessions_cache: Optional[Tuple[PlexServer, float, list]] = None
+        self._sessions_lock = asyncio.Lock()
 
     async def initialize(self) -> None:
         """Initialize all services"""
@@ -130,6 +142,76 @@ class BotServices:
             logger.debug(f"Plex reconnect failed: {str(e)[:80]}")
             self.plex_server = None
             return False
+
+    def _cached_sessions(self, server: PlexServer, max_age: float) -> Optional[list]:
+        """The cached snapshot if it belongs to `server` and is young enough."""
+        if self._sessions_cache is None:
+            return None
+        cached_server, fetched_at, sessions = self._sessions_cache
+        if cached_server is not server:
+            # A reconnect replaced the server object. What the old one reported
+            # says nothing about the new connection, so treat it as absent.
+            return None
+        if (time.monotonic() - fetched_at) > max_age:
+            return None
+        return sessions
+
+    async def plex_sessions(
+        self,
+        max_age: float = PLEX_SESSIONS_MAX_AGE,
+        force: bool = False,
+    ) -> list:
+        """Current Plex sessions, shared by every plugin that polls for them.
+
+        Four consumers want the same fact - who is streaming right now.
+        watch_tracking drives it at a hardcoded 10 seconds; service_health probes
+        it and watch_party verifies the streamer against it on intervals taken
+        from config (HEALTH_CHECK_INTERVAL and WATCH_PARTY_CREDIT_INTERVAL,
+        currently 300s each, which is why their @tasks.loop decorator defaults of
+        30s and 10s are misleading); /status reads it on demand. Each was issuing
+        its own request for one snapshot.
+
+        At today's intervals that overlap is small - watch_tracking accounts for
+        almost all of the ~8,900 requests a day. The value here is that the
+        overlap no longer scales: turning either interval down, which their
+        decorator defaults suggest was once intended, now costs nothing extra.
+
+        Only successful fetches are cached, and the entry is tied to the identity
+        of the PlexServer it came from, so a reconnect invalidates it without any
+        explicit bookkeeping.
+
+        `force=True` skips *reading* the cache but still writes it: a health probe
+        satisfied from cache is not a probe, yet its fresh result is perfectly
+        good for everyone else.
+
+        Raises whatever plexapi raises. Callers already guard on plex_server
+        being present; failing loudly is better than reporting an empty session
+        list, which reads as "nobody is watching".
+        """
+        server = self.plex_server
+        if server is None:
+            raise RuntimeError("Plex server is not connected")
+
+        if not force:
+            cached = self._cached_sessions(server, max_age)
+            if cached is not None:
+                return cached
+
+        async with self._sessions_lock:
+            # Re-check under the lock. Two loops firing in the same moment is the
+            # exact case this method exists to collapse, and without this the
+            # second one would still issue its own request.
+            server = self.plex_server
+            if server is None:
+                raise RuntimeError("Plex server is not connected")
+            if not force:
+                cached = self._cached_sessions(server, max_age)
+                if cached is not None:
+                    return cached
+
+            sessions = await run_blocking(server.sessions)
+            self._sessions_cache = (server, time.monotonic(), sessions)
+            return sessions
 
     async def cleanup(self) -> None:
         """Cleanup services on shutdown"""
