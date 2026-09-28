@@ -7,6 +7,7 @@ from typing import Dict
 from datetime import datetime, timezone
 from sqlalchemy import select
 
+from core.permissions import require_admin
 from core.logging import get_logger
 from core.services import BotServices
 from database.session import get_session
@@ -188,18 +189,6 @@ class InviteTrackerCog(commands.Cog):
 
     # Admin Command - Only accessible by users with ADMIN_ROLE_ID
 
-    def _has_admin_role(self, interaction: discord.Interaction) -> bool:
-        """Check if user has the admin role"""
-        admin_role_id = self.services.config.admin_role_id
-        if not admin_role_id:
-            return False
-
-        member = interaction.guild.get_member(interaction.user.id)
-        if not member:
-            return False
-
-        return any(role.id == admin_role_id for role in member.roles)
-
     @app_commands.command(name="who-invited", description="Check who invited a specific user")
     @app_commands.default_permissions(administrator=True)
     @app_commands.guild_only()
@@ -208,13 +197,13 @@ class InviteTrackerCog(commands.Cog):
         """Check who invited a specific member - Admin only"""
         await interaction.response.defer(ephemeral=True)
 
-        # Check if user has admin role
-        if not self._has_admin_role(interaction):
-            embed = create_error_embed(
-                "Permission Denied",
-                "You need the Admin role to use this command."
-            )
-            await interaction.followup.send(embed=embed, ephemeral=True)
+        # The shared guard, not a local role-only test. This command is gated to
+        # `administrator` at the Discord level, and the old _has_admin_role
+        # accepted *only* ADMIN_ROLE_ID - returning False when that is unset - so a
+        # server owner who had not configured the role could see the command and
+        # then be refused it. is_bot_admin accepts guild administrator, the admin
+        # role, or the bot owner, which is what the gate above promises.
+        if not await require_admin(interaction):
             return
 
         try:
