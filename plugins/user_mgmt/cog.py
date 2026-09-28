@@ -8,8 +8,7 @@ from typing import Optional, Dict, Any
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, update, delete
 
 from core.blocking import run_blocking
 from core.permissions import AdminOnlyView
@@ -73,95 +72,156 @@ class UserMgmtCog(commands.Cog):
             # Build lookup by friendly_name (case-insensitive)
             tautulli_lookup = {u.get('friendly_name', '').lower(): u for u in tautulli_users}
 
+            # Three phases, so that no Discord DM, plex.tv login or Tautulli call
+            # happens while a database transaction is open.
+            #
+            # This used to be one `async with get_session()` wrapped around the
+            # whole loop, including _send_warning_dm and _remove_inactive_user -
+            # the latter logs into plex.tv, calls removeFriend, sends a DM and
+            # edits a Discord role. The journal mode on this database is `delete`,
+            # not WAL, so the read transaction opened by the SELECT below holds a
+            # SHARED lock for its whole lifetime: every other plugin's kv_set
+            # would queue behind it and, after the 5s busy timeout, fail with
+            # "database is locked". With a handful of users the window was short
+            # enough that it never actually bit; it grows with the user count.
+
+            # Phase 1: read, then close. expire_on_commit=False, so the loaded
+            # column values stay readable on the detached objects below.
             async with get_session() as session:
-                # Get all tracked Plex users
                 result = await session.execute(select(PlexUser))
                 tracked_users = result.scalars().all()
 
-                for tracked_user in tracked_users:
-                    # Find corresponding Tautulli user
-                    tautulli_user = tautulli_lookup.get(tracked_user.plex_username.lower())
+            def persisted_fields(user: PlexUser):
+                """The columns this check is allowed to change."""
+                return (user.last_watched, user.days_inactive, user.warning_sent)
 
-                    if not tautulli_user:
-                        logger.warning(f"Tracked user {tracked_user.plex_username} not found in Tautulli - skipping (may be new)")
-                        # Don't auto-delete - user might just not have watched anything yet
+            # Snapshot up front so the write phase can tell what changed, rather
+            # than relying on every assignment site below to remember to flag
+            # itself. Note this only actually skips the rows that take one of the
+            # `continue` paths without assigning anything: on the main branch
+            # last_watched is reassigned from Tautulli as a tz-aware datetime while
+            # the column reads back naive, and those never compare equal, so such a
+            # row is always rewritten. That is correct, just not a saving.
+            before = {user.id: persisted_fields(user) for user in tracked_users}
+
+            # Phase 2: decide. No transaction, no network - the field assignments
+            # here are made on detached objects and persisted in phase 4.
+            to_warn = []
+            to_remove = []
+
+            for tracked_user in tracked_users:
+                # Find corresponding Tautulli user
+                tautulli_user = tautulli_lookup.get(tracked_user.plex_username.lower())
+
+                if not tautulli_user:
+                    logger.warning(f"Tracked user {tracked_user.plex_username} not found in Tautulli - skipping (may be new)")
+                    # Don't auto-delete - user might just not have watched anything yet
+                    continue
+
+                # Get last watched from Tautulli
+                last_played = tautulli_user.get('last_seen')
+
+                if last_played:
+                    # Convert Unix timestamp to datetime
+                    last_watched = datetime.fromtimestamp(int(last_played), tz=timezone.utc)
+                    created_at = tracked_user.created_at.replace(tzinfo=timezone.utc) if tracked_user.created_at.tzinfo is None else tracked_user.created_at
+
+                    # Ignore historical watch activity that predates the current tracking entry.
+                    # This prevents freshly re-approved users from being immediately re-removed
+                    # because Tautulli still reports an older last_seen from before reinvite.
+                    if last_watched < created_at:
+                        tracked_user.days_inactive = 0
+                        tracked_user.warning_sent = False
+                        logger.info(
+                            f"User {tracked_user.plex_username}: ignoring stale Tautulli last_seen {last_watched.isoformat()} before tracking start {created_at.isoformat()}"
+                        )
                         continue
 
-                    # Get last watched from Tautulli
-                    last_played = tautulli_user.get('last_seen')
+                    days_since = (datetime.now(timezone.utc) - last_watched).days
 
-                    if last_played:
-                        # Convert Unix timestamp to datetime
-                        last_watched = datetime.fromtimestamp(int(last_played), tz=timezone.utc)
-                        created_at = tracked_user.created_at.replace(tzinfo=timezone.utc) if tracked_user.created_at.tzinfo is None else tracked_user.created_at
+                    # Update tracked user
+                    tracked_user.last_watched = last_watched
+                    tracked_user.days_inactive = days_since
 
-                        # Ignore historical watch activity that predates the current tracking entry.
-                        # This prevents freshly re-approved users from being immediately re-removed
-                        # because Tautulli still reports an older last_seen from before reinvite.
-                        if last_watched < created_at:
-                            tracked_user.days_inactive = 0
-                            tracked_user.warning_sent = False
-                            logger.info(
-                                f"User {tracked_user.plex_username}: ignoring stale Tautulli last_seen {last_watched.isoformat()} before tracking start {created_at.isoformat()}"
-                            )
-                            continue
+                    # Reset warning flag if user became active again. Use the
+                    # configured threshold, not a hardcoded 25, so the reset and
+                    # the warning below cannot desynchronize.
+                    if days_since < self.services.config.inactivity_warning_days:
+                        tracked_user.warning_sent = False
 
-                        days_since = (datetime.now(timezone.utc) - last_watched).days
+                    logger.info(f"User {tracked_user.plex_username}: {days_since} days inactive")
 
-                        # Update tracked user
-                        tracked_user.last_watched = last_watched
+                    # Warning uses >= not ==: this loop runs every 24h and restarts
+                    # with the bot, so an exact-day match is skipped whenever a
+                    # pass is missed, and the user would then hit the removal
+                    # threshold having never been warned.
+                    if days_since >= self.services.config.inactivity_warning_days and not tracked_user.warning_sent:
+                        to_warn.append(tracked_user)
+                        # Deliberately do not remove on the same pass that warns,
+                        # even if already past the removal threshold: a warning
+                        # nobody had a chance to act on is not a warning.
+                        continue
+
+                    # Removal, only ever after a warning was delivered.
+                    if days_since >= self.services.config.inactivity_removal_days:
+                        to_remove.append((tracked_user, tautulli_user.get('user_id', 0)))
+                        continue
+
+                else:
+                    # No history found - might be a new user
+                    if tracked_user.last_watched is None:
+                        # New user with no activity yet
+                        tracked_user.days_inactive = 0
+                    else:
+                        # Existing user with no new activity
+                        last_watched_aware = tracked_user.last_watched.replace(tzinfo=timezone.utc) if tracked_user.last_watched.tzinfo is None else tracked_user.last_watched
+                        days_since = (datetime.now(timezone.utc) - last_watched_aware).days
                         tracked_user.days_inactive = days_since
 
-                        # Reset warning flag if user became active again. Use the
-                        # configured threshold, not a hardcoded 25, so the reset and
-                        # the warning below cannot desynchronize.
-                        if days_since < self.services.config.inactivity_warning_days:
-                            tracked_user.warning_sent = False
-
-                        logger.info(f"User {tracked_user.plex_username}: {days_since} days inactive")
-
-                        # Warning uses >= not ==: this loop runs every 24h and restarts
-                        # with the bot, so an exact-day match is skipped whenever a
-                        # pass is missed, and the user would then hit the removal
-                        # threshold having never been warned.
+                        # Same warn-then-remove sequencing as the branch above.
                         if days_since >= self.services.config.inactivity_warning_days and not tracked_user.warning_sent:
-                            await self._send_warning_dm(tracked_user)
-                            tracked_user.warning_sent = True
-                            # Deliberately do not remove on the same pass that warns,
-                            # even if already past the removal threshold: a warning
-                            # nobody had a chance to act on is not a warning.
+                            to_warn.append(tracked_user)
                             continue
 
-                        # Removal, only ever after a warning was delivered.
                         if days_since >= self.services.config.inactivity_removal_days:
-                            user_id = tautulli_user.get('user_id', 0)
-                            await self._remove_inactive_user(tracked_user, user_id, session)
-                            continue  # User removed, skip update
+                            to_remove.append((tracked_user, tautulli_user.get('user_id', 0)))
+                            continue
 
-                    else:
-                        # No history found - might be a new user
-                        if tracked_user.last_watched is None:
-                            # New user with no activity yet
-                            tracked_user.days_inactive = 0
-                        else:
-                            # Existing user with no new activity
-                            last_watched_aware = tracked_user.last_watched.replace(tzinfo=timezone.utc) if tracked_user.last_watched.tzinfo is None else tracked_user.last_watched
-                            days_since = (datetime.now(timezone.utc) - last_watched_aware).days
-                            tracked_user.days_inactive = days_since
+            # Phase 3: the slow part, with nothing held open.
+            for tracked_user in to_warn:
+                await self._send_warning_dm(tracked_user)
+                # Set unconditionally, as before: _send_warning_dm swallows its own
+                # delivery errors, and only marking on success would mean a user
+                # with closed DMs is warned every day and never removed.
+                tracked_user.warning_sent = True
 
-                            # Same warn-then-remove sequencing as the branch above.
-                            if days_since >= self.services.config.inactivity_warning_days and not tracked_user.warning_sent:
-                                await self._send_warning_dm(tracked_user)
-                                tracked_user.warning_sent = True
-                                continue
+            removed_ids = set()
+            for tracked_user, plex_user_id in to_remove:
+                if await self._remove_inactive_user(tracked_user, plex_user_id):
+                    removed_ids.add(tracked_user.id)
 
-                            if days_since >= self.services.config.inactivity_removal_days:
-                                user_id = tautulli_user.get('user_id', 0)
-                                await self._remove_inactive_user(tracked_user, user_id, session)
-                                continue
-
+            # Phase 4: one short write. A failed removal deliberately keeps its row
+            # and still persists the updated activity fields, so the next pass
+            # retries with current numbers.
+            async with get_session() as session:
+                for tracked_user in tracked_users:
+                    if tracked_user.id in removed_ids:
+                        await session.execute(
+                            delete(PlexUser).where(PlexUser.id == tracked_user.id)
+                        )
+                    elif persisted_fields(tracked_user) != before[tracked_user.id]:
+                        await session.execute(
+                            update(PlexUser)
+                            .where(PlexUser.id == tracked_user.id)
+                            .values(
+                                last_watched=tracked_user.last_watched,
+                                days_inactive=tracked_user.days_inactive,
+                                warning_sent=tracked_user.warning_sent,
+                            )
+                        )
                 await session.commit()
-                logger.info("Daily inactivity check completed")
+
+            logger.info("Daily inactivity check completed")
 
         except Exception as e:
             logger.error(f"Error during inactivity check: {e}", exc_info=True)
@@ -339,8 +399,13 @@ class UserMgmtCog(commands.Cog):
         except Exception as e:
             logger.error(f"Error sending warning DM to {user.plex_username}: {e}")
 
-    async def _remove_inactive_user(self, user: PlexUser, plex_user_id: int, session: AsyncSession):
-        """Remove user from Plex and send farewell message"""
+    async def _remove_inactive_user(self, user: PlexUser, plex_user_id: int) -> bool:
+        """Remove user from Plex and send farewell. True if the row should be deleted.
+
+        The caller deletes the row in its own short transaction. Doing it here
+        required an open session to be threaded through plex.tv logins and Discord
+        DMs, which is exactly the lock window this avoids.
+        """
         try:
             # Collect stats up front (needs the account to still exist in Tautulli),
             # but do not announce anything until the removal actually succeeds -
@@ -353,7 +418,7 @@ class UserMgmtCog(commands.Cog):
                     f"Cannot remove {user.plex_username} from Plex: PLEX_USERNAME/PLEX_PASSWORD "
                     f"not configured. Keeping tracking row so this retries."
                 )
-                return
+                return False
 
             try:
                 from plexapi.myplex import MyPlexAccount
@@ -377,19 +442,20 @@ class UserMgmtCog(commands.Cog):
                     f"keeping tracking row so the next pass retries",
                     exc_info=True
                 )
-                return
+                return False
 
             # Removal succeeded - now notify and clean up Discord state.
             if user.discord_id:
                 await self._send_farewell_dm(user, stats)
                 await self._remove_plex_role(user.discord_id)
 
-            # Remove from database
-            await session.delete(user)
-            logger.info(f"Removed {user.plex_username} from tracking database")
+            # Signal the caller to drop the tracking row.
+            logger.info(f"Removing {user.plex_username} from tracking database")
+            return True
 
         except Exception as e:
             logger.error(f"Error removing inactive user {user.plex_username}: {e}", exc_info=True)
+            return False
 
     async def _send_farewell_dm(self, user: PlexUser, stats: Dict[str, Any]):
         """Send farewell message with user stats"""
@@ -541,74 +607,81 @@ class UserMgmtCog(commands.Cog):
                 await interaction.followup.send("❌ Plex server not configured", ephemeral=True)
                 return
 
+            # Read the tracking row, then close the session. Everything after this
+            # point is plex.tv, Tautulli and Discord I/O; holding a transaction
+            # across it locks the database against every other plugin for as long
+            # as those calls take. Same restructuring as the automatic path,
+            # check_inactive_users.
             async with get_session() as session:
-                # Find user in tracking
                 result = await session.execute(
                     select(PlexUser).where(PlexUser.plex_username == plex_username)
                 )
                 tracked_user = result.scalar_one_or_none()
 
-                if not tracked_user:
-                    await interaction.followup.send(
-                        f"❌ User `{plex_username}` not found in tracking database.\n"
-                        f"They may not be tracked or may not exist on the Plex server.",
-                        ephemeral=True
-                    )
-                    return
-
-                # Find Plex user
-                plex_users = await run_blocking(self.services.plex_server.systemAccounts)
-                plex_user = next((u for u in plex_users if u.name == plex_username), None)
-
-                if not plex_user:
-                    await interaction.followup.send(
-                        f"❌ Plex user `{plex_username}` not found on server",
-                        ephemeral=True
-                    )
-                    return
-
-                # Collect stats up front (the account must still exist in Tautulli),
-                # but do not tell the user anything until the removal has actually
-                # succeeded. The DM is titled "Removed from Plex Server", so sending
-                # it first meant a failed removal left the user believing they had
-                # lost access while they still had it. Same ordering already fixed
-                # in the automatic path, _remove_inactive_user.
-                stats = await self._get_user_stats(plex_username)
-
-                # Remove from Plex
-                try:
-                    from plexapi.myplex import MyPlexAccount
-
-                    account = await run_blocking(
-                        MyPlexAccount,
-                        self.services.config.plex_username,
-                        self.services.config.plex_password,
-                    )
-                    friend_key = tracked_user.plex_email or plex_username
-                    await run_blocking(account.removeFriend, friend_key)
-                    logger.info(f"Manually removed {plex_username} from Plex by {interaction.user.name}")
-                except Exception as e:
-                    logger.error(f"Error removing {plex_username} from Plex: {e}")
-                    await interaction.followup.send(
-                        f"❌ Error removing user from Plex: {str(e)}",
-                        ephemeral=True
-                    )
-                    return
-
-                # Removal succeeded - now notify and clean up Discord state.
-                if tracked_user.discord_id:
-                    await self._send_manual_removal_dm(tracked_user, stats, interaction.user.name)
-                    await self._remove_plex_role(tracked_user.discord_id)
-
-                # Remove from database
-                await session.delete(tracked_user)
-                await session.commit()
-
+            if not tracked_user:
                 await interaction.followup.send(
-                    f"✅ Successfully removed `{plex_username}` from Plex server and tracking database.\n"
-                    f"User has been notified via DM.",
+                    f"❌ User `{plex_username}` not found in tracking database.\n"
+                    f"They may not be tracked or may not exist on the Plex server.",
                     ephemeral=True
                 )
+                return
+
+            # Find Plex user
+            plex_users = await run_blocking(self.services.plex_server.systemAccounts)
+            plex_user = next((u for u in plex_users if u.name == plex_username), None)
+
+            if not plex_user:
+                await interaction.followup.send(
+                    f"❌ Plex user `{plex_username}` not found on server",
+                    ephemeral=True
+                )
+                return
+
+            # Collect stats up front (the account must still exist in Tautulli),
+            # but do not tell the user anything until the removal has actually
+            # succeeded. The DM is titled "Removed from Plex Server", so sending
+            # it first meant a failed removal left the user believing they had
+            # lost access while they still had it. Same ordering already fixed
+            # in the automatic path, _remove_inactive_user.
+            stats = await self._get_user_stats(plex_username)
+
+            # Remove from Plex
+            try:
+                from plexapi.myplex import MyPlexAccount
+
+                account = await run_blocking(
+                    MyPlexAccount,
+                    self.services.config.plex_username,
+                    self.services.config.plex_password,
+                )
+                friend_key = tracked_user.plex_email or plex_username
+                await run_blocking(account.removeFriend, friend_key)
+                logger.info(f"Manually removed {plex_username} from Plex by {interaction.user.name}")
+            except Exception as e:
+                logger.error(f"Error removing {plex_username} from Plex: {e}")
+                await interaction.followup.send(
+                    f"❌ Error removing user from Plex: {str(e)}",
+                    ephemeral=True
+                )
+                return
+
+            # Removal succeeded - now notify and clean up Discord state.
+            if tracked_user.discord_id:
+                await self._send_manual_removal_dm(tracked_user, stats, interaction.user.name)
+                await self._remove_plex_role(tracked_user.discord_id)
+
+            # Drop the tracking row in its own short transaction.
+            async with get_session() as session:
+                await session.execute(
+                    delete(PlexUser).where(PlexUser.id == tracked_user.id)
+                )
+                await session.commit()
+
+            await interaction.followup.send(
+                f"✅ Successfully removed `{plex_username}` from Plex server and tracking database.\n"
+                f"User has been notified via DM.",
+                ephemeral=True
+            )
 
         except Exception as e:
             logger.error(f"Error in manual user removal: {e}", exc_info=True)
@@ -1230,15 +1303,16 @@ class LinkUserView(AdminOnlyView):
         await interaction.response.defer(ephemeral=True)
 
         try:
+            # Resolve the Discord user before opening a transaction: fetch_user is
+            # a REST call, and nothing below needs the session in order to make it.
+            discord_user = await self.bot.fetch_user(self.selected_discord_id)
+
             async with get_session() as session:
                 # Check if Plex user already exists
                 result = await session.execute(
                     select(PlexUser).where(PlexUser.plex_username == self.selected_plex_username)
                 )
                 existing_user = result.scalar_one_or_none()
-
-                # Get Discord user info
-                discord_user = await self.bot.fetch_user(self.selected_discord_id)
 
                 if existing_user:
                     # Update existing Plex user with Discord link
@@ -1361,26 +1435,29 @@ class UnlinkUserView(AdminOnlyView):
         await interaction.response.defer(ephemeral=True)
 
         try:
+            # Do the lookup and the write, then close before replying: the
+            # not-found reply used to be sent with the read transaction still open.
             async with get_session() as session:
                 result = await session.execute(
                     select(PlexUser).where(PlexUser.id == self.selected_user_id)
                 )
                 user = result.scalar_one_or_none()
 
-                if not user:
-                    await interaction.followup.send("❌ User not found", ephemeral=True)
-                    return
+                if user:
+                    # Store info for confirmation message
+                    discord_username = user.discord_username
+                    plex_username = user.plex_username
+                    discord_id = user.discord_id
 
-                # Store info for confirmation message
-                discord_username = user.discord_username
-                plex_username = user.plex_username
-                discord_id = user.discord_id
+                    # Remove Discord link (keep Plex user entry for tracking)
+                    user.discord_id = None
+                    user.discord_username = None
 
-                # Remove Discord link (keep Plex user entry for tracking)
-                user.discord_id = None
-                user.discord_username = None
+                    await session.commit()
 
-                await session.commit()
+            if not user:
+                await interaction.followup.send("❌ User not found", ephemeral=True)
+                return
 
             # Success message
             embed = discord.Embed(

@@ -124,42 +124,45 @@ class InviteTrackerCog(commands.Cog):
 
             logger.info(f"{member} joined via invite {used_invite.code} created by {used_invite.inviter}")
 
-            # Record the invite use in database
+            # Assign the auto-role first, then record the outcome. The previous
+            # order added the row and flushed it - taking SQLite's write lock -
+            # and then made a Discord REST call with that lock still held, which
+            # blocks every other plugin's writes for the duration of the call.
+            auto_role_assigned = False
+            assigned_role_id = None
+
+            if used_invite.inviter and used_invite.inviter.id == bot_owner_id:
+                role = guild.get_role(homies_role_id)
+
+                if role:
+                    try:
+                        await member.add_roles(role, reason=f"Auto-role: Invited by bot owner")
+                        logger.info(f"✅ Assigned {role.name} role to {member} (invited by bot owner)")
+                        auto_role_assigned = True
+                        assigned_role_id = str(role.id)
+
+                    except discord.Forbidden:
+                        logger.error(f"❌ No permission to assign role {role.name} to {member}")
+                    except Exception as e:
+                        logger.error(f"❌ Error assigning role: {e}")
+                else:
+                    logger.warning(f"⚠️ Homies role (ID: {homies_role_id}) not found in guild")
+            else:
+                logger.info(f"Member was not invited by bot owner, no auto-role assigned")
+
+            # Record the invite use and the role outcome in one short write.
             async with get_session() as session:
-                invite_use = InviteUse(
+                session.add(InviteUse(
                     guild_id=str(guild.id),
                     invite_code=used_invite.code,
                     inviter_id=str(used_invite.inviter.id) if used_invite.inviter else "0",
                     inviter_name=str(used_invite.inviter) if used_invite.inviter else "Unknown",
                     joiner_id=str(member.id),
                     joiner_name=str(member),
-                    joined_at=datetime.now(timezone.utc)
-                )
-                session.add(invite_use)
-                await session.flush()
-
-                # Check if the inviter is the bot owner
-                if used_invite.inviter and used_invite.inviter.id == bot_owner_id:
-                    role = guild.get_role(homies_role_id)
-
-                    if role:
-                        try:
-                            await member.add_roles(role, reason=f"Auto-role: Invited by bot owner")
-                            logger.info(f"✅ Assigned {role.name} role to {member} (invited by bot owner)")
-
-                            # Update database to record role assignment
-                            invite_use.auto_role_assigned = True
-                            invite_use.role_id = str(role.id)
-
-                        except discord.Forbidden:
-                            logger.error(f"❌ No permission to assign role {role.name} to {member}")
-                        except Exception as e:
-                            logger.error(f"❌ Error assigning role: {e}")
-                    else:
-                        logger.warning(f"⚠️ Homies role (ID: {homies_role_id}) not found in guild")
-                else:
-                    logger.info(f"Member was not invited by bot owner, no auto-role assigned")
-
+                    joined_at=datetime.now(timezone.utc),
+                    auto_role_assigned=auto_role_assigned,
+                    role_id=assigned_role_id,
+                ))
                 await session.commit()
 
             # Update cache

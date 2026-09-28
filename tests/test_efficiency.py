@@ -661,3 +661,121 @@ def test_the_polling_consumers_share_the_snapshot():
         "call services.plex_sessions() instead of fetching sessions directly:\n  "
         + "\n  ".join(offenders)
     )
+
+
+# ===================================================================
+# 9. No database transaction is held open across network I/O
+# ===================================================================
+
+#: Awaited calls that leave the process. A database transaction must not be open
+#: across any of them: this SQLite database runs in `delete` journal mode, not
+#: WAL, so a read transaction holds a SHARED lock (blocking writers) and a
+#: flushed write holds RESERVED/EXCLUSIVE (blocking readers too) until commit.
+#: busy_timeout is 5s, after which the blocked caller gets "database is locked".
+NETWORK_AWAITS = (
+    "send", "fetch_user", "fetch_channel", "fetch_message", "run_blocking",
+    "removeFriend", "add_roles", "remove_roles", "_get_user_stats",
+    "_remove_plex_role", "_dm",
+)
+
+
+def _opens_a_session(node):
+    for item in node.items:
+        expr = item.context_expr
+        if isinstance(expr, ast.Call):
+            func = expr.func
+            name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
+            if name == "get_session":
+                return True
+    return False
+
+
+def _sessions_held_across_network_io():
+    for rel, text in _source_files():
+        tree = ast.parse(text)
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.With, ast.AsyncWith)):
+                continue
+            if not _opens_a_session(node):
+                continue
+            for inner in ast.walk(node):
+                if not isinstance(inner, ast.Await) or not isinstance(inner.value, ast.Call):
+                    continue
+                func = inner.value.func
+                name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
+                # session.execute / session.commit / session.delete are the point.
+                if (
+                    isinstance(func, ast.Attribute)
+                    and isinstance(func.value, ast.Name)
+                    and func.value.id == "session"
+                ):
+                    continue
+                if any(key in name for key in NETWORK_AWAITS):
+                    yield f"{rel}:{inner.lineno} ({name}() inside session opened at line {node.lineno})"
+
+
+def test_no_session_is_held_open_across_network_io():
+    """Read, close, do the slow work, then write.
+
+    check_inactive_users wrapped one session around its whole loop - including a
+    plex.tv login, removeFriend, a Tautulli stats fetch, a DM and a Discord role
+    edit, per user. The manual /remove-user command did the same, and
+    invite_tracker flushed its row (taking the write lock) before awaiting
+    add_roles. Every other plugin's kv_set queues behind those.
+    """
+    offenders = sorted(set(_sessions_held_across_network_io()))
+    assert offenders == [], (
+        "these hold a database transaction open across a network call:\n  "
+        + "\n  ".join(offenders)
+    )
+
+
+def test_remove_inactive_user_reports_whether_the_row_should_go():
+    """It no longer takes a session, so the caller needs a truthful answer."""
+    from plugins.user_mgmt.cog import UserMgmtCog
+
+    signature = inspect.signature(UserMgmtCog._remove_inactive_user)
+    assert "session" not in signature.parameters, (
+        "passing a session in is what forced the transaction to stay open across "
+        "plex.tv and Discord calls"
+    )
+
+    source = inspect.getsource(UserMgmtCog._remove_inactive_user)
+    tree = ast.parse(inspect.cleandoc("\n".join(source.splitlines()[1:])))
+    returns = [
+        node.value.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Return) and isinstance(node.value, ast.Constant)
+    ]
+    assert True in returns, "no path reports success, so no row would ever be deleted"
+    assert False in returns, (
+        "a failed Plex removal must return False so the row is kept and retried"
+    )
+
+
+def test_a_failed_plex_removal_keeps_the_tracking_row():
+    """Behavioural: the row is the only record that a retry is owed."""
+    from plugins.user_mgmt.cog import UserMgmtCog
+    from plugins.user_mgmt.models import PlexUser
+
+    class FakeConfig:
+        plex_username = None      # not configured -> removal cannot proceed
+        plex_password = None
+
+    class FakeServices:
+        config = FakeConfig()
+
+    cog = object.__new__(UserMgmtCog)
+    cog.services = FakeServices()
+
+    async def _stats(username):
+        return {}
+
+    cog._get_user_stats = _stats
+
+    user = PlexUser(plex_username="someone", plex_email="a@example.com")
+    removed = asyncio.run(cog._remove_inactive_user(user, 1))
+    assert removed is False, (
+        "returning anything truthy here would delete the row while the user still "
+        "has Plex access, with no record left to retry against"
+    )
