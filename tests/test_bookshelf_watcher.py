@@ -286,3 +286,75 @@ def test_expire_runs_even_when_no_items_are_present():
     # scan_loop is a discord.ext.tasks.Loop, so reach through to its coroutine.
     source = inspect.getsource(BookshelfProcessorCog.scan_loop.coro)
     assert "_expire_stale_hints" in source
+
+
+# --- download_cover: the writes moved to a worker thread, the files must still land ---
+
+class _FakeResponse:
+    def __init__(self, body):
+        self._body = body
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    def raise_for_status(self):
+        pass
+
+    async def read(self):
+        return self._body
+
+
+class _FakeSession:
+    def __init__(self, body, calls):
+        self._body, self._calls = body, calls
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    def get(self, url):
+        self._calls.append(url)
+        return _FakeResponse(self._body)
+
+
+def _download_cover(body, dest, cache_dir):
+    from plugins.bookshelf_processor import cog as module
+
+    calls = []
+    original = module.aiohttp.ClientSession
+    module.aiohttp.ClientSession = lambda **kw: _FakeSession(body, calls)
+    try:
+        ok = asyncio.run(module.download_cover("https://covers.example/1.jpg", dest, cache_dir))
+    finally:
+        module.aiohttp.ClientSession = original
+    return ok, calls
+
+
+def test_download_cover_writes_destination_and_cache():
+    root = _tmpdir()
+    cache, dest = root / "cache", root / "lib" / "cover.jpg"
+    cache.mkdir()
+    dest.parent.mkdir()
+    body = b"\xff\xd8" + b"x" * 5000
+    ok, calls = _download_cover(body, dest, cache)
+    assert ok and len(calls) == 1
+    assert dest.read_bytes() == body
+    cached = list(cache.iterdir())
+    assert len(cached) == 1 and cached[0].read_bytes() == body
+
+
+def test_download_cover_copies_from_cache_without_fetching():
+    root = _tmpdir()
+    cache, dest = root / "cache", root / "lib" / "cover.jpg"
+    cache.mkdir()
+    dest.parent.mkdir()
+    body = b"\xff\xd8" + b"y" * 5000
+    _download_cover(body, root / "first.jpg", cache)  # populate the cache
+    ok, calls = _download_cover(b"never fetched", dest, cache)
+    assert ok and calls == [], "a cache hit must not refetch"
+    assert dest.read_bytes() == body

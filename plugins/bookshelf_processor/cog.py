@@ -824,6 +824,18 @@ def _best_match(docs: list, author: str, title: str) -> dict | None:
     return None
 
 
+def _write_cover(content: bytes, dest: Path, cache_path: Path | None) -> None:
+    """Save to cache and destination. Blocking, so call via run_blocking.
+
+    dest is in the library on the array through shfs, not the cache SSD.
+    Measured 2026-09-30: a 6.8 MB cover took 137 ms median and 388 ms max to
+    write, all of it with the event loop stopped when done inline.
+    """
+    if cache_path:
+        cache_path.write_bytes(content)
+    dest.write_bytes(content)
+
+
 async def download_cover(url: str, dest: Path, cache_dir: Path | None = None) -> bool:
     """Download cover art, using cache to avoid redundant fetches."""
     if dest.exists():
@@ -836,7 +848,8 @@ async def download_cover(url: str, dest: Path, cache_dir: Path | None = None) ->
         cache_path = cache_dir / f"{cache_key}.jpg"
 
         if cache_path.exists():
-            shutil.copy2(str(cache_path), str(dest))
+            # dest is on the array via shfs: off the loop (see _write_cover).
+            await run_blocking(shutil.copy2, str(cache_path), str(dest))
             logger.debug(f"Cover from cache: {dest}")
             return True
     else:
@@ -854,10 +867,7 @@ async def download_cover(url: str, dest: Path, cache_dir: Path | None = None) ->
             logger.warning(f"Cover too small ({len(content)} bytes), skipping: {url}")
             return False
 
-        # Save to cache and destination
-        if cache_path:
-            cache_path.write_bytes(content)
-        dest.write_bytes(content)
+        await run_blocking(_write_cover, content, dest, cache_path)
         logger.info(f"Cover downloaded: {dest.name} ({len(content)} bytes)")
         return True
 
