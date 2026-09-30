@@ -8,6 +8,8 @@ The codebase historically used two different admin conventions:
 ``is_bot_admin`` accepts either, plus the configured bot owner, so adopting it
 does not revoke access from anyone who had it before.
 """
+import functools
+
 import discord
 
 from core.logging import get_logger
@@ -103,3 +105,102 @@ class AdminOnlyView(discord.ui.View):
         )
         await deny(interaction)
         return False
+
+
+class AdminActionView(AdminOnlyView):
+    """An AdminOnlyView whose buttons cannot be acted on twice at once.
+
+    Disabling the buttons and editing the message is not a guard. It is a
+    client-side render, and it takes a round-trip - Discord can deliver a second
+    interaction before the first edit lands. For a button that has an external
+    side effect (submitting to Overseerr, queueing a download, inviting a Plex
+    user) that means the side effect happens twice.
+
+    The guard is an in-process set of message ids being acted on. Shared per
+    subclass rather than per instance, because each request is posted with a fresh
+    view while the bot is up but every pending request falls back to the single
+    argument-less instance registered at startup - an instance-level set would not
+    span both.
+
+    Usage:
+
+        if not await self.claim(interaction):
+            return
+        try:
+            ...
+        finally:
+            self.release(interaction)
+    """
+
+    #: Replaced per subclass by __init_subclass__, so two view types cannot
+    #: collide on a shared registry.
+    _in_flight: set = set()
+
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        cls._in_flight = set()
+
+    @staticmethod
+    def _key(interaction: discord.Interaction):
+        message = getattr(interaction, "message", None)
+        return getattr(message, "id", None)
+
+    async def claim(self, interaction: discord.Interaction) -> bool:
+        """Reserve this message. False if another click is already being handled.
+
+        On a refusal the interaction is answered, so the caller only has to return.
+        """
+        key = self._key(interaction)
+        if key is None:
+            # No message to key on; nothing to protect against.
+            return True
+
+        if key in self._in_flight:
+            logger.info(
+                f"Ignoring duplicate {type(self).__name__} action on message {key} "
+                f"from {interaction.user}: one is already in progress"
+            )
+            try:
+                await interaction.response.send_message(
+                    "That request is already being handled - give it a moment.",
+                    ephemeral=True,
+                )
+            except discord.HTTPException as e:
+                logger.debug(f"Could not answer duplicate interaction: {e}")
+            return False
+
+        self._in_flight.add(key)
+        return True
+
+    def release(self, interaction: discord.Interaction) -> None:
+        """Release the reservation. Safe to call even if claim() was never called."""
+        key = self._key(interaction)
+        if key is not None:
+            self._in_flight.discard(key)
+
+
+def single_flight(handler):
+    """Decorate a button callback so two clicks cannot run it concurrently.
+
+    Apply it *under* @discord.ui.button, so the button decorator receives the
+    wrapped coroutine:
+
+        @discord.ui.button(label="Approve", custom_id="approve")
+        @single_flight
+        async def approve(self, interaction, button): ...
+
+    Requires the view to be an AdminActionView (or anything providing claim and
+    release). The duplicate click is answered by claim(), so the handler simply
+    does not run.
+    """
+
+    @functools.wraps(handler)
+    async def wrapper(self, interaction, button):
+        if not await self.claim(interaction):
+            return
+        try:
+            return await handler(self, interaction, button)
+        finally:
+            self.release(interaction)
+
+    return wrapper

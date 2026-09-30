@@ -12,7 +12,7 @@ from discord import app_commands
 from discord.ext import commands
 
 from core.logging import get_logger
-from core.permissions import AdminOnlyView
+from core.permissions import AdminActionView, AdminOnlyView, single_flight
 from core.services import BotServices
 from core.admin_mirror import send_user_dm
 from utils.embeds import create_error_embed
@@ -731,7 +731,7 @@ class BookConfirmationView(discord.ui.View):
             json.dump(requests_data, f, indent=2)
 
 
-class BookAdminApprovalView(AdminOnlyView):
+class BookAdminApprovalView(AdminActionView):
     """Admin approval buttons for book requests.
 
     Admin-gated: approving submits downloads to NZBHydra/SABnzbd.
@@ -739,6 +739,13 @@ class BookAdminApprovalView(AdminOnlyView):
     def __init__(self, book: dict = None, user_id: int = None, services: BotServices = None):
         super().__init__(timeout=None)
         self.book = book
+        # These two used to be assigned at the end of on_error, one indent level
+        # out, which meant __init__ silently dropped both arguments *and* on_error
+        # raised NameError on two free names - so whenever a button failed, the
+        # handler meant to report it failed instead. Masked because approve and
+        # decline both call _load_from_saved first, which sets all three.
+        self.user_id = user_id
+        self.services = services
 
     async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item):
         logger.error(f"BookAdminApprovalView error on {item.custom_id}: {error}", exc_info=True)
@@ -749,8 +756,6 @@ class BookAdminApprovalView(AdminOnlyView):
                 await interaction.followup.send(f"❌ Error: {error}", ephemeral=True)
         except Exception:
             pass
-        self.user_id = user_id
-        self.services = services
 
     def _load_from_saved(self, message_id: int, bot) -> bool:
         """Load request data from saved requests file after restart"""
@@ -769,6 +774,7 @@ class BookAdminApprovalView(AdminOnlyView):
         return False
 
     @discord.ui.button(label="✅ Approve", style=discord.ButtonStyle.success, custom_id="approve_book_request")
+    @single_flight
     async def approve(self, interaction: discord.Interaction, button: discord.ui.Button):
         logger.info(f"Book approve button clicked by {interaction.user} for message {interaction.message.id}")
 
@@ -1051,6 +1057,7 @@ class BookAdminApprovalView(AdminOnlyView):
             return False
 
     @discord.ui.button(label="❌ Decline", style=discord.ButtonStyle.danger, custom_id="decline_book_request")
+    @single_flight
     async def decline(self, interaction: discord.Interaction, button: discord.ui.Button):
         logger.info(f"Book decline button clicked by {interaction.user} for message {interaction.message.id}")
         # Always load from saved
@@ -1192,7 +1199,7 @@ class ConfirmationView(discord.ui.View):
             json.dump(requests, f, indent=2)
 
 
-class AdminApprovalView(AdminOnlyView):
+class AdminApprovalView(AdminActionView):
     """Admin approval buttons.
 
     Admin-gated: approving submits to Overseerr and changes Sonarr/Radarr
@@ -1428,6 +1435,7 @@ class AdminApprovalView(AdminOnlyView):
         }
 
     @discord.ui.button(label="✅ Approve", style=discord.ButtonStyle.success, custom_id="approve_request")
+    @single_flight
     async def approve(self, interaction: discord.Interaction, button: discord.ui.Button):
         logger.info(f"Media approve button clicked by {interaction.user} for message {interaction.message.id}")
         try:
@@ -1474,6 +1482,7 @@ class AdminApprovalView(AdminOnlyView):
             await interaction.followup.send(result["followup_message"], ephemeral=True)
     
     @discord.ui.button(label="❌ Decline", style=discord.ButtonStyle.danger, custom_id="decline_request")
+    @single_flight
     async def decline(self, interaction: discord.Interaction, button: discord.ui.Button):
         logger.info(f"Media decline button clicked by {interaction.user} for message {interaction.message.id}")
         # Always load from saved
