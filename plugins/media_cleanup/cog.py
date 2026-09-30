@@ -1,7 +1,6 @@
 # path: plugins/media_cleanup/cog.py
 """Media cleanup plugin - removes unwatched content after 3 months"""
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 import json
 from typing import Optional, List, Dict, Any
 
@@ -23,7 +22,6 @@ logger = get_logger(__name__)
 # Namespace for cleanup data
 CLEANUP_NAMESPACE = "media_cleanup"
 
-NEW_MEDIA_TRACKING_FILE = Path("config/new_media_tracking.json")
 REQUEST_EXPIRY_DAYS = 90
 
 # Default configuration
@@ -301,20 +299,6 @@ class MediaCleanupCog(commands.Cog):
         except Exception as e:
             logger.error(f"Error saving tracking data: {e}")
 
-    def _load_json_file(self, path: Path, default):
-        try:
-            if not path.exists():
-                return default
-            with open(path) as f:
-                return json.load(f)
-        except Exception as e:
-            logger.error(f"Failed to load JSON file {path}: {e}")
-            return default
-
-    def _save_json_file(self, path: Path, data):
-        with open(path, "w") as f:
-            json.dump(data, f, indent=2)
-
     def _normalize_title(self, value: Optional[str]) -> str:
         if not value:
             return ""
@@ -417,41 +401,21 @@ class MediaCleanupCog(commands.Cog):
             logger.info(f"Pruned {len(to_remove)} stale media tracking entries")
         return len(to_remove)
 
-    def _prune_new_media_tracking_cache(self, latest_requests: Dict[tuple, Dict[str, Any]], cutoff: datetime) -> int:
-        data = self._load_json_file(NEW_MEDIA_TRACKING_FILE, {})
-        if not data:
-            return 0
-
-        kept = {}
-        removed = 0
-        for key, value in data.items():
-            last_update = self._parse_request_timestamp(value.get("last_update"))
-            if not last_update or last_update >= cutoff:
-                kept[key] = value
-                continue
-
-            title_key = self._normalize_title(value.get("show_title"))
-            season = int(value.get("season") or 0)
-            has_recent_request = False
-            for (media_type, _tmdb_id), request in latest_requests.items():
-                if media_type != "tv" or request["timestamp"] < cutoff:
-                    continue
-                media_title = self._normalize_title(request["media"].get("title") or request["media"].get("name"))
-                seasons = request.get("seasons")
-                season_match = seasons == "all" or not seasons or (isinstance(seasons, list) and season in {int(s) for s in seasons})
-                if media_title == title_key and season_match:
-                    has_recent_request = True
-                    break
-
-            if has_recent_request:
-                kept[key] = value
-            else:
-                removed += 1
-
-        if removed:
-            self._save_json_file(NEW_MEDIA_TRACKING_FILE, kept)
-            logger.info(f"Pruned {removed} stale new-media tracking entries")
-        return removed
+    # _prune_new_media_tracking_cache was removed here.
+    #
+    # It read config/new_media_tracking.json, which has contained "{}" since that
+    # store moved into the database - so it returned 0 every time and its figure in
+    # the daily summary was always 0 regardless of reality.
+    #
+    # It is not reinstated against the database because new_media_added owns that
+    # namespace and keeps an in-memory copy of it. A second writer deleting rows
+    # behind its back would be resurrected by its next save. Its cleanup_old_batches
+    # loop now deletes properly, so the store has exactly one owner.
+    #
+    # One gap is left, deliberately: batches with is_monitored set are never pruned,
+    # because that flag means a requester is still waiting and dropping the batch
+    # would lose their notification. Nothing re-checks whether the request behind
+    # one is still outstanding, so they accumulate (8 of 56 at the time of writing).
 
     async def enforce_request_monitor_cleanup(self) -> Dict[str, int]:
         # One query, not a 661 KB parse. Same shape as the file it replaces, so
@@ -466,7 +430,6 @@ class MediaCleanupCog(commands.Cog):
             "movie_unmonitored": 0,
             "movie_reenabled": 0,
             "media_tracking_pruned": 0,
-            "new_media_tracking_pruned": 0,
         }
 
         try:
@@ -519,7 +482,6 @@ class MediaCleanupCog(commands.Cog):
             logger.error(f"Error enforcing Radarr request monitoring cleanup: {e}", exc_info=True)
 
         summary["media_tracking_pruned"] = self._prune_media_tracking_cache(latest_requests, cutoff)
-        summary["new_media_tracking_pruned"] = self._prune_new_media_tracking_cache(latest_requests, cutoff)
         return summary
 
     @tasks.loop(hours=24)
@@ -1123,7 +1085,7 @@ class MediaCleanupCog(commands.Cog):
             value=(
                 f"TV off: {monitor_summary['tv_unmonitored']} | TV on: {monitor_summary['tv_reenabled']}\n"
                 f"Movies off: {monitor_summary['movie_unmonitored']} | Movies on: {monitor_summary['movie_reenabled']}\n"
-                f"Tracking pruned: {monitor_summary['media_tracking_pruned']} + {monitor_summary['new_media_tracking_pruned']}"
+                f"Tracking pruned: {monitor_summary['media_tracking_pruned']}"
             ),
             inline=False
         )

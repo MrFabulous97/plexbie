@@ -123,6 +123,30 @@ async def kv_delete(namespace: str, key: str) -> bool:
         return result.rowcount > 0
 
 
+async def kv_delete_many(namespace: str, keys) -> int:
+    """Delete several keys in one transaction. Returns the number removed.
+
+    The counterpart to kv_set_many, and the reason it exists: new_media_added
+    pruned its batches out of an in-memory dict and then saved the survivors,
+    which upserts and therefore left every removed row in place. It logged
+    "Cleaned up 47 old batches" twenty times over, on the same 47 batches, because
+    each restart loaded them straight back.
+    """
+    keys = [str(key) for key in keys]
+    if not keys:
+        return 0
+
+    async with get_session() as session:
+        result = await session.execute(
+            delete(KeyValueStore).where(
+                KeyValueStore.namespace == namespace,
+                KeyValueStore.key.in_(keys),
+            )
+        )
+        await session.commit()
+        return result.rowcount or 0
+
+
 async def kv_get_all(namespace: str) -> Dict[str, Any]:
     """Get all key-value pairs in a namespace"""
     async with get_session() as session:

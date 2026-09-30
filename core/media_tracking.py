@@ -395,24 +395,10 @@ class MediaTrackingManager:
             tracked.notification_channel_id = channel_id
             self.save_tracking_data()
 
-    def cleanup_old_completed(self, days: int = 7):
-        """Remove completed tracking entries older than specified days"""
-
-        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
-        to_remove = []
-
-        for key, tracked in self.tracked_media.items():
-            if tracked.completion_timestamp:
-                completion = datetime.fromisoformat(tracked.completion_timestamp)
-                if completion < cutoff:
-                    to_remove.append(key)
-
-        for key in to_remove:
-            del self.tracked_media[key]
-
-        if to_remove:
-            self.save_tracking_data()
-            logger.info(f"Cleaned up {len(to_remove)} old completed tracking entries")
+    # cleanup_old_completed was removed here: it was defined and never called from
+    # anywhere. media_cleanup._prune_media_tracking_cache already prunes this store
+    # on the daily loop, request-aware and verified working, so a second unused
+    # pruner was only a thing to mistake for coverage.
 
 
 # Global instance

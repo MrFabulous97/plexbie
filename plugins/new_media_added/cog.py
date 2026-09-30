@@ -13,7 +13,7 @@ from utils.formatting import episode_label, season_episode
 from utils.embeds import truncate_field
 from core.logging import get_logger
 from core.services import BotServices
-from database.kv_store import kv_get, kv_set_many, kv_get_all
+from database.kv_store import kv_get, kv_set_many, kv_get_all, kv_delete_many
 
 logger = get_logger(__name__)
 
@@ -152,23 +152,48 @@ class NewMediaAddedCog(commands.Cog):
 
     @tasks.loop(minutes=5)
     async def cleanup_old_batches(self):
-        """Remove old batches that are no longer active"""
-        # Ensure data is loaded
+        """Forget batches that have been idle for a day and are not being watched for.
+
+        Removing them from active_batches is not enough on its own:
+        save_tracking_data upserts the survivors, so every removed row stayed in the
+        database and came back on the next restart. The log said "Cleaned up 47 old
+        batches" twenty times over - the same 47 each time - and 48 of 56 rows were
+        stale by the time anyone counted.
+
+        Monitored batches are deliberately never removed here. is_monitored means a
+        requester is still waiting on that show, and dropping the batch would lose
+        the "your request is available" notification. They do accumulate as a
+        result; nothing currently re-checks whether the request behind one is still
+        outstanding.
+        """
         await self.load_tracking_data()
 
         cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
-        to_remove = []
-
-        for key, batch in self.active_batches.items():
-            if batch.last_update < cutoff and not batch.is_monitored:
-                to_remove.append(key)
+        to_remove = [
+            key for key, batch in self.active_batches.items()
+            if batch.last_update < cutoff and not batch.is_monitored
+        ]
+        if not to_remove:
+            return
 
         for key in to_remove:
             del self.active_batches[key]
 
-        if to_remove:
-            await self.save_tracking_data()
-            logger.info(f"Cleaned up {len(to_remove)} old batches")
+        try:
+            removed = await kv_delete_many(NEW_MEDIA_NAMESPACE, to_remove)
+        except Exception as e:
+            # The keys are already out of active_batches, so leaving it there would
+            # let a later save write a set that disagrees with the database. Reload
+            # from the database instead and treat it as the authority.
+            logger.error(f"Could not delete old batches, reloading from database: {e}")
+            self.active_batches.clear()
+            self._data_loaded = False
+            await self.load_tracking_data()
+            return
+
+        logger.info(
+            f"Cleaned up {len(to_remove)} old batch(es); {removed} row(s) deleted"
+        )
 
     def get_batch_key(self, show_title: str, season: int) -> str:
         """Generate a unique key for a show/season batch"""
