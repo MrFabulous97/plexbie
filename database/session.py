@@ -2,6 +2,9 @@
 """Database session management"""
 from contextlib import asynccontextmanager
 
+import json
+from pathlib import Path
+
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
 
@@ -30,6 +33,7 @@ async def init_database(db_url: str):
         await conn.run_sync(Base.metadata.create_all)
         await _migrate_kv_unique(conn)
         await _migrate_add_columns(conn)
+        await _migrate_media_requests_to_kv(conn)
 
     logger.info("Database initialized")
 
@@ -43,6 +47,63 @@ _ADDED_COLUMNS = (
     ("plex_users", "is_top_watcher", "BOOLEAN NOT NULL DEFAULT 0"),
     ("plex_users", "exemption_lost_at", "DATETIME"),
 )
+
+
+#: The JSON file media requests used to live in, before one row per request.
+_LEGACY_REQUESTS_FILE = Path("config/media_requests.json")
+
+
+async def _migrate_media_requests_to_kv(conn):
+    """Copy config/media_requests.json into the key-value store. Idempotent.
+
+    ON CONFLICT DO NOTHING rather than DO UPDATE, deliberately: once a request
+    lives in the database it is the authority, and re-reading a stale file must
+    never clobber a status the bot has since recorded.
+
+    The file is left on disk untouched, as a backup. Nothing reads it afterwards.
+    """
+    try:
+        if not _LEGACY_REQUESTS_FILE.exists():
+            return
+
+        raw = json.loads(_LEGACY_REQUESTS_FILE.read_text() or "{}")
+        if not isinstance(raw, dict) or not raw:
+            return
+
+        existing = await conn.execute(text(
+            "SELECT COUNT(*) FROM key_value_store WHERE namespace = 'media_requests'"
+        ))
+        already = existing.scalar() or 0
+
+        inserted = 0
+        for message_id, record in raw.items():
+            if not isinstance(record, dict):
+                continue
+            await conn.execute(
+                text(
+                    "INSERT INTO key_value_store (namespace, key, value) "
+                    "VALUES ('media_requests', :key, :value) "
+                    "ON CONFLICT (namespace, key) DO NOTHING"
+                ),
+                {"key": str(message_id), "value": json.dumps(record)},
+            )
+            inserted += 1
+
+        after = await conn.execute(text(
+            "SELECT COUNT(*) FROM key_value_store WHERE namespace = 'media_requests'"
+        ))
+        total = after.scalar() or 0
+        if total != already:
+            logger.info(
+                f"Migrated media requests into the database: {len(raw)} in the file, "
+                f"{already} already present, {total} now stored "
+                f"(config/media_requests.json left in place as a backup)"
+            )
+    except Exception as e:
+        # Never block startup. The plugins read the database; a failure here means
+        # older requests are missing from it, which is visible and recoverable,
+        # whereas a bot that will not start is neither.
+        logger.error(f"Could not migrate media requests into the database: {e}")
 
 
 async def _migrate_add_columns(conn):

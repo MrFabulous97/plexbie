@@ -16,11 +16,19 @@ from core.permissions import AdminActionView, AdminOnlyView, single_flight
 from core.services import BotServices
 from core.admin_mirror import send_user_dm
 from utils.embeds import create_error_embed
+from database.request_store import (
+    STATUS_APPROVED,
+    STATUS_DECLINED,
+    get_request,
+    mark_resolved,
+    save_request,
+)
 
 logger = get_logger(__name__)
 
 # Storage file for requests
-REQUESTS_FILE = Path("config/media_requests.json")
+#: The requests store moved into the database (see database/request_store.py).
+#: The old file is left on disk as a backup and is no longer read or written.
 
 
 # Language names that may indicate a non-English release. Matched as whole
@@ -713,22 +721,13 @@ class BookConfirmationView(discord.ui.View):
         view = BookAdminApprovalView(self.book, interaction.user.id, self.services)
         message = await admin_channel.send(embed=embed, view=view)
 
-        # Save request
-        requests_data = {}
-        if REQUESTS_FILE.exists():
-            with open(REQUESTS_FILE) as f:
-                requests_data = json.load(f)
-
-        requests_data[str(message.id)] = {
-            "user_id": interaction.user.id,
-            "media": self.book,
-            "media_type": format_type,
-            "status": "pending",
-            "timestamp": datetime.utcnow().isoformat()
-        }
-
-        with open(REQUESTS_FILE, 'w') as f:
-            json.dump(requests_data, f, indent=2)
+        # One keyed write, not a rewrite of every request ever made.
+        await save_request(
+            message.id,
+            user_id=interaction.user.id,
+            media=self.book,
+            media_type=format_type,
+        )
 
 
 class BookAdminApprovalView(AdminActionView):
@@ -757,18 +756,19 @@ class BookAdminApprovalView(AdminActionView):
         except Exception:
             pass
 
-    def _load_from_saved(self, message_id: int, bot) -> bool:
-        """Load request data from saved requests file after restart"""
+    async def _load_from_saved(self, message_id: int, bot) -> bool:
+        """Restore this view's request from the database. True if found.
+
+        Async now, and a single keyed read: this used to parse the whole request
+        file on every button click.
+        """
         try:
-            if REQUESTS_FILE.exists():
-                with open(REQUESTS_FILE) as f:
-                    requests_data = json.load(f)
-                req = requests_data.get(str(message_id))
-                if req:
-                    self.book = req.get('media', {})
-                    self.user_id = req.get('user_id')
-                    self.services = bot.services
-                    return True
+            record = await get_request(message_id)
+            if record:
+                self.book = record.get('media', {})
+                self.user_id = record.get('user_id')
+                self.services = bot.services
+                return True
         except Exception as e:
             logger.error(f"Failed to load saved book request: {e}")
         return False
@@ -785,7 +785,7 @@ class BookAdminApprovalView(AdminActionView):
 
 
         # Always load from saved to ensure we have data
-        if not self._load_from_saved(interaction.message.id, interaction.client):
+        if not await self._load_from_saved(interaction.message.id, interaction.client):
             logger.error(f"Could not load book request data for message {interaction.message.id}")
             await interaction.followup.send("❌ Could not find request data. Please re-submit.", ephemeral=True)
             return
@@ -831,6 +831,8 @@ class BookAdminApprovalView(AdminActionView):
 
         embed.add_field(name="✅ Approved by", value=status_text, inline=False)
         await interaction.message.edit(embed=embed, view=None)
+
+        await mark_resolved(interaction.message.id, STATUS_APPROVED, str(interaction.user))
 
         # DM the requesting user with specific status
         user = interaction.client.get_user(self.user_id)
@@ -1061,7 +1063,7 @@ class BookAdminApprovalView(AdminActionView):
     async def decline(self, interaction: discord.Interaction, button: discord.ui.Button):
         logger.info(f"Book decline button clicked by {interaction.user} for message {interaction.message.id}")
         # Always load from saved
-        if not self._load_from_saved(interaction.message.id, interaction.client):
+        if not await self._load_from_saved(interaction.message.id, interaction.client):
             await interaction.response.send_message("❌ Could not find request data.", ephemeral=True)
             return
 
@@ -1074,6 +1076,8 @@ class BookAdminApprovalView(AdminActionView):
         )
 
         await interaction.response.edit_message(embed=embed, view=None)
+
+        await mark_resolved(interaction.message.id, STATUS_DECLINED, str(interaction.user))
 
         user = interaction.client.get_user(self.user_id)
         if user:
@@ -1177,26 +1181,17 @@ class ConfirmationView(discord.ui.View):
         message = await admin_channel.send(embed=embed, view=view)
 
         # Save request
-        self._save_request(interaction.user.id, self.media, message.id, self.seasons, self.monitor)
-    
-    def _save_request(self, user_id: int, media: dict, message_id: int, seasons=None, monitor=False):
-        """Save request to file"""
-        requests = {}
-        if REQUESTS_FILE.exists():
-            with open(REQUESTS_FILE) as f:
-                requests = json.load(f)
+        await self._save_request(interaction.user.id, self.media, message.id, self.seasons, self.monitor)
 
-        requests[str(message_id)] = {
-            "user_id": user_id,
-            "media": media,
-            "seasons": seasons,
-            "monitor": monitor,
-            "status": "pending",
-            "timestamp": datetime.utcnow().isoformat()
-        }
-
-        with open(REQUESTS_FILE, 'w') as f:
-            json.dump(requests, f, indent=2)
+    async def _save_request(self, user_id: int, media: dict, message_id: int, seasons=None, monitor=False):
+        """Record the request against its approval message, as one keyed write."""
+        await save_request(
+            message_id,
+            user_id=user_id,
+            media=media,
+            seasons=seasons,
+            monitor=monitor,
+        )
 
 
 class AdminApprovalView(AdminActionView):
@@ -1205,6 +1200,7 @@ class AdminApprovalView(AdminActionView):
     Admin-gated: approving submits to Overseerr and changes Sonarr/Radarr
     monitoring state.
     """
+
     def __init__(self, media: dict = None, user_id: int = None, services: BotServices = None, seasons=None, monitor=False):
         super().__init__(timeout=None)  # Persistent
         self.media = media
@@ -1224,24 +1220,23 @@ class AdminApprovalView(AdminActionView):
         except Exception:
             pass
 
-    def _load_from_saved(self, message_id: int, bot) -> bool:
-        """Load request data from saved requests file after restart"""
+    async def _load_from_saved(self, message_id: int, bot) -> bool:
+        """Restore this view's request from the database. True if found.
+
+        Async now, and a single keyed read - see the book view's equivalent.
+        """
         try:
-            if REQUESTS_FILE.exists():
-                with open(REQUESTS_FILE) as f:
-                    requests_data = json.load(f)
-                req = requests_data.get(str(message_id))
-                if req:
-                    self.media = req.get('media', {})
-                    self.user_id = req.get('user_id')
-                    self.seasons = req.get('seasons')
-                    self.monitor = req.get('monitor', False)
-                    self.services = bot.services
-                    return True
+            record = await get_request(message_id)
+            if record:
+                self.media = record.get('media', {})
+                self.user_id = record.get('user_id')
+                self.seasons = record.get('seasons')
+                self.monitor = record.get('monitor', False)
+                self.services = bot.services
+                return True
         except Exception as e:
             logger.error(f"Failed to load saved request: {e}")
         return False
-
     def _title(self) -> str:
         return self.media.get('title') or self.media.get('name', 'Unknown')
 
@@ -1445,7 +1440,7 @@ class AdminApprovalView(AdminActionView):
             return
 
         # Always load from saved to ensure we have data
-        if not self._load_from_saved(interaction.message.id, interaction.client):
+        if not await self._load_from_saved(interaction.message.id, interaction.client):
             logger.error(f"Could not load media request data for message {interaction.message.id}")
             await interaction.followup.send("❌ Could not find request data. Please re-submit.", ephemeral=True)
             return
@@ -1467,6 +1462,7 @@ class AdminApprovalView(AdminActionView):
             )
             
             await interaction.message.edit(embed=embed, view=None)
+            await mark_resolved(interaction.message.id, STATUS_APPROVED, str(interaction.user))
             
             # Notify user
             user = interaction.client.get_user(self.user_id)
@@ -1486,7 +1482,7 @@ class AdminApprovalView(AdminActionView):
     async def decline(self, interaction: discord.Interaction, button: discord.ui.Button):
         logger.info(f"Media decline button clicked by {interaction.user} for message {interaction.message.id}")
         # Always load from saved
-        if not self._load_from_saved(interaction.message.id, interaction.client):
+        if not await self._load_from_saved(interaction.message.id, interaction.client):
             await interaction.response.send_message("❌ Could not find request data.", ephemeral=True)
             return
 
@@ -1500,6 +1496,12 @@ class AdminApprovalView(AdminActionView):
         )
         
         await interaction.response.edit_message(embed=embed, view=None)
+
+        # Record the outcome. Additive - the record stays, because the daily
+        # Sonarr/Radarr monitoring reconciliation still reads it. This only makes
+        # "what is still waiting on me" answerable: before, every record claimed
+        # to be pending, including ones actioned a year earlier.
+        await mark_resolved(interaction.message.id, STATUS_DECLINED, str(interaction.user))
         
         # Notify user
         user = interaction.client.get_user(self.user_id)
@@ -1635,10 +1637,6 @@ class MediaRequestsCog(commands.Cog):
         self.bot = bot
         self.services = services
 
-        # Ensure requests file exists
-        REQUESTS_FILE.parent.mkdir(exist_ok=True)
-        if not REQUESTS_FILE.exists():
-            REQUESTS_FILE.write_text("{}")
 
     async def cog_load(self):
         """Register the persistent approval views.

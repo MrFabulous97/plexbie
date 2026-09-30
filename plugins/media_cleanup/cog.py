@@ -16,12 +16,13 @@ from core.permissions import AdminOnlyView, require_admin
 from core.services import BotServices
 from utils.embeds import create_info_embed, create_error_embed, truncate_field
 from database.kv_store import kv_get, kv_set
+from database.request_store import all_requests
 
 logger = get_logger(__name__)
 
 # Namespace for cleanup data
 CLEANUP_NAMESPACE = "media_cleanup"
-REQUESTS_FILE = Path("config/media_requests.json")
+
 NEW_MEDIA_TRACKING_FILE = Path("config/new_media_tracking.json")
 REQUEST_EXPIRY_DAYS = 90
 
@@ -453,7 +454,10 @@ class MediaCleanupCog(commands.Cog):
         return removed
 
     async def enforce_request_monitor_cleanup(self) -> Dict[str, int]:
-        requests_data = self._load_json_file(REQUESTS_FILE, {})
+        # One query, not a 661 KB parse. Same shape as the file it replaces, so
+        # _latest_requests_by_media is unchanged - and so is every decision it
+        # drives about Sonarr/Radarr monitoring.
+        requests_data = await all_requests()
         latest_requests = self._latest_requests_by_media(requests_data)
         cutoff = datetime.now(timezone.utc) - timedelta(days=REQUEST_EXPIRY_DAYS)
         summary = {
