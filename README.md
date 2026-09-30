@@ -87,7 +87,7 @@ cache with the same interface.
 ### Docker (recommended)
 
 ```bash
-git clone https://github.com/MrFabulous97/plexbie.git
+git clone https://github.com/zevbox/plexbie.git
 cd plexbie
 cp config/.env.example config/.env
 ```
