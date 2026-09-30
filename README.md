@@ -99,33 +99,18 @@ and `PLEX_TOKEN`. Then:
 docker build -t plexbie:latest .
 ```
 
-Write a compose file for your own host. A minimal one:
-
-```yaml
-services:
-  plexbie:
-    image: plexbie:latest
-    container_name: plexbie
-    restart: unless-stopped
-    network_mode: host
-    volumes:
-      - ./config:/app/config          # .env and the SQLite database live here
-      - ./logs:/app/logs
-      # Only needed if you use the bookshelf_processor plugin:
-      - /path/to/downloads/audiobooks:/watch/audiobooks
-      - /path/to/downloads/ebooks:/watch/ebooks
-      - /path/to/library/audiobooks:/library/audiobooks
-      - /path/to/library/ebooks:/library/ebooks
-```
+The committed `docker-compose.yml` uses relative paths, so it works from a fresh
+clone as-is:
 
 ```bash
 docker compose up -d
 docker compose logs -f plexbie
 ```
 
-> The `docker-compose.yml` committed here is the maintainer's own deployment and
-> contains absolute Unraid host paths. Treat it as an example, not a starting
-> point.
+It mounts `./config` (your `.env` and the SQLite database) and `./logs`. The four
+media mounts are only needed for the `bookshelf_processor` plugin — point them at
+your download client's completed directories and the library you want built, or
+delete them if you do not use it.
 
 `network_mode: host` is deliberate: the webhook listener binds to `127.0.0.1` by
 default, which only keeps it off the network if the container shares the host's
@@ -532,10 +517,13 @@ Worth knowing before you rely on this:
   `/list-plex-users show: Only malformed accounts` reports them with manual
   removal steps.
 - **No CI.** Run `tests/run_all.py` yourself.
-- **No licence yet.** Until a `LICENSE` file is added, default copyright applies
-  and others have no rights to reuse the code.
 
 ---
+
+## Licence
+
+MIT - see [LICENSE](LICENSE). Do what you like with it; there is no warranty.
+
 
 ## Contributing
 

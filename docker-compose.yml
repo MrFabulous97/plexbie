@@ -1,27 +1,49 @@
 # Plexbie Discord bot.
 #
-# The plexbie-web and nginx services were removed on 2026-09-27: the web UI was
-# no longer in use. Their source, config, TLS certs and a full image archive are
-# preserved under backups/plexbie-web-decommission-*/ if it is ever wanted back.
+# This file is meant to work from a fresh clone: the paths are relative, so
+# `docker compose up -d` from the repository root mounts ./config and ./logs and
+# starts the bot. Adjust the media paths below if you use bookshelf_processor.
 #
-# The bot uses network_mode: host, so it never depended on the bridge network
-# those services shared, and all three of their mounts were read-only.
+# The maintainer's own deployment uses a separate compose file with absolute host
+# paths, kept outside this repository. If you are that maintainer: this file is
+# not the one rebuild.sh reads, so editing it here changes nothing about the
+# running bot.
+#
+# Build the image first:
+#     docker build -t plexbie:latest .
 services:
   plexbie:
     image: plexbie:latest
     container_name: plexbie
     restart: unless-stopped
-    network_mode: host
     working_dir: /app
     command: ["python", "-u", "bot.py"]
+
+    # The webhook listener binds to 127.0.0.1 by default (WEBHOOK_BIND), which
+    # only keeps it off the network if the container shares the host's network
+    # namespace. If you swap this for a bridge network with published ports, set
+    # a secret for every webhook you enable first - a route with no secret
+    # configured accepts unauthenticated requests. See the README's Security
+    # section.
+    network_mode: host
+
     volumes:
-      - /mnt/user/appdata/plexbie/plexbie/plugins/media_cleanup:/app/plugins/media_cleanup
-      - /mnt/user/appdata/plexbie/plexbie/plugins/media_requests:/app/plugins/media_requests
-      - /mnt/user/appdata/plexbie/plexbie/plugins/new_media_added:/app/plugins/new_media_added
-      - /mnt/user/appdata/plexbie/plexbie/core/media_tracking.py:/app/core/media_tracking.py
-      - /mnt/user/data/usenet/complete/audiobooks:/watch/audiobooks
-      - /mnt/user/data/usenet/complete/ebooks:/watch/ebooks
-      - /mnt/user/data/media/audiobooks:/library/audiobooks
-      - /mnt/user/data/media/ebooks:/library/ebooks
-      - /mnt/user/appdata/plexbie/config:/app/config
-      - /mnt/user/appdata/plexbie/logs:/app/logs
+      # config/.env and the SQLite database live here. Keep this directory off
+      # any file-syncing tool: syncing a live SQLite file can corrupt it.
+      - ./config:/app/config
+      - ./logs:/app/logs
+
+      # Only needed for the bookshelf_processor plugin, which files finished
+      # audiobook and ebook downloads into an Audiobookshelf-shaped library.
+      # Point the first two at your download client's completed directories and
+      # the second two at the library it should build. Override the container
+      # paths with BOOKSHELF_* in config/.env if these do not suit you.
+      - ./media/downloads/audiobooks:/watch/audiobooks
+      - ./media/downloads/ebooks:/watch/ebooks
+      - ./media/library/audiobooks:/library/audiobooks
+      - ./media/library/ebooks:/library/ebooks
+
+      # Deliberately no bind mounts over individual plugins. The maintainer's
+      # deployment carried four of them as an edit-without-rebuilding shortcut,
+      # which is a silent hazard: a stale file on the host overrides the code in
+      # the image with no indication that it has.

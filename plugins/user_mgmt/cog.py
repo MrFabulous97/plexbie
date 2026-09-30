@@ -31,6 +31,24 @@ INVITES_NAMESPACE = "plex_invites"
 MAX_LISTED_USERS = 25
 
 
+def _fetch_shared_usernames(plex_username: str, plex_password: str) -> set:
+    """Blocking: the names that currently have access to the server.
+
+    This is NOT systemAccounts(). That endpoint lists every account the server has
+    ever seen, including ones whose access was removed - a user taken off the share
+    yesterday is still in it today, verified. Anything using it to answer "does
+    this person still have access" gets the wrong answer, and always in the
+    direction of saying yes.
+
+    Current access lives on plex.tv, which is also where removeFriend acts. Note
+    the owner does not appear in their own share list, so callers must add them.
+    """
+    from plexapi.myplex import MyPlexAccount
+
+    account = MyPlexAccount(plex_username, plex_password)
+    return {user.title for user in account.users() if user.title}
+
+
 class UserMgmtCog(commands.Cog):
     """User management with automatic inactivity removal"""
 
@@ -51,6 +69,45 @@ class UserMgmtCog(commands.Cog):
     def _load_watch_aliases():
         """Blocking: the alias map used to group watch time by person."""
         return load_aliases()
+
+    async def _plex_users_with_access(self):
+        """Names that currently have access, or None if it cannot be determined.
+
+        Returning None matters: the caller must then decline to judge, rather than
+        treat an empty answer as "nobody has access" and flag every tracked user
+        as an orphan. Needs PLEX_USERNAME/PLEX_PASSWORD, because current access
+        lives on plex.tv.
+        """
+        config = self.services.config
+        if not (config.plex_username and config.plex_password):
+            return None
+        try:
+            shared = await run_blocking(
+                _fetch_shared_usernames, config.plex_username, config.plex_password
+            )
+        except Exception as e:
+            logger.warning(f"Could not read Plex shares, skipping orphan check: {e}")
+            return None
+
+        # The owner is never in their own share list.
+        owner = await self._plex_owner_name()
+        if owner:
+            shared.add(owner)
+        return shared
+
+    async def _plex_owner_name(self):
+        """The server owner's account name, which is systemAccounts id 1."""
+        if not self.services.plex_server:
+            return None
+        try:
+            accounts = await run_blocking(self.services.plex_server.systemAccounts)
+        except Exception as e:
+            logger.debug(f"Could not read Plex system accounts: {e}")
+            return None
+        for account in accounts:
+            if account.id == 1:
+                return account.name
+        return None
 
     def _is_permanently_exempt(self, user: PlexUser) -> bool:
         """The server owner is never a removal candidate.
@@ -971,9 +1028,12 @@ class UserMgmtCog(commands.Cog):
                 await interaction.followup.send("No tracked users found.", ephemeral=True)
                 return
 
-            # Get Plex users to check for orphans
-            plex_users = await run_blocking(self.services.plex_server.systemAccounts) if self.services.plex_server else []
-            plex_usernames = {u.name for u in plex_users}
+            # Who currently has access. Deliberately not systemAccounts(): that
+            # lists every account the server has ever seen, so a user removed from
+            # the share is still in it and would never be flagged - which is the
+            # one case this flag exists for.
+            with_access = await self._plex_users_with_access()
+            can_check_orphans = with_access is not None
 
             embed = discord.Embed(
                 title="📊 Tracked Plex Users",
@@ -983,8 +1043,9 @@ class UserMgmtCog(commands.Cog):
 
             # Count orphans across ALL tracked users, not just the visible page -
             # computing it inside the display loop understated the real number.
-            orphaned_count = sum(
-                1 for user in tracked_users if user.plex_username not in plex_usernames
+            orphaned_count = (
+                sum(1 for user in tracked_users if user.plex_username not in with_access)
+                if can_check_orphans else 0
             )
 
             shown = tracked_users[:MAX_LISTED_USERS]
@@ -993,7 +1054,9 @@ class UserMgmtCog(commands.Cog):
                 status_emoji = "🟢" if user.days_inactive < 25 else "🟡" if user.days_inactive < 30 else "🔴"
 
                 # Check if orphaned
-                is_orphaned = user.plex_username not in plex_usernames
+                is_orphaned = (
+                    can_check_orphans and user.plex_username not in with_access
+                )
                 if is_orphaned:
                     status_emoji = "⚠️"
 
@@ -1023,6 +1086,11 @@ class UserMgmtCog(commands.Cog):
                 notes.append(
                     f"⚠️ {orphaned_count} not on Plex - remove with /remove-user "
                     f"(not cleaned up automatically)"
+                )
+            if not can_check_orphans:
+                notes.append(
+                    "Could not verify who still has access (PLEX_USERNAME/"
+                    "PLEX_PASSWORD unset or plex.tv unreachable) - no orphan flags shown"
                 )
             if notes:
                 embed.set_footer(text=" · ".join(notes))
