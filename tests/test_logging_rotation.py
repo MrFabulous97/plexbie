@@ -16,7 +16,7 @@ from pathlib import Path
 import conftest  # noqa: F401
 
 from core.logging import (
-    DEFAULT_BACKUP_COUNT, DEFAULT_MAX_BYTES, JSONFormatter, _env_int,
+    DEFAULT_BACKUP_COUNT, DEFAULT_MAX_BYTES, JSONFormatter, _HANDLER_TAG, _env_int,
     setup_logging,
 )
 
@@ -58,9 +58,19 @@ def _silence_console():
 
 
 def _file_handlers():
+    """The file handlers *this project* installed, not every one on the root logger.
+
+    Filtering on isinstance(FileHandler) alone was wrong: under pytest the logging
+    plugin installs its own _pytest.logging._FileHandler pointing at /dev/null,
+    which is a FileHandler and is not rotating - so the suite passed under
+    run_all.py and failed under pytest, and the README claimed both worked.
+
+    _HANDLER_TAG is the marker setup_logging already uses to recognise its own
+    handlers so repeated calls replace rather than stack them.
+    """
     return [
         h for h in logging.getLogger().handlers
-        if isinstance(h, logging.FileHandler)
+        if isinstance(h, logging.FileHandler) and getattr(h, _HANDLER_TAG, False)
     ]
 
 
