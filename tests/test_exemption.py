@@ -432,3 +432,58 @@ def test_aliased_identities_count_as_one_for_the_exemption():
     assert rows["Sammy"]["is_top_watcher"] == 1, (
         "560s combined should rank first; split it would be 60s and outside the top 3"
     )
+
+
+# ===================================================================
+# the inactivity clock always runs from something
+# ===================================================================
+
+def test_a_newly_tracked_user_gets_a_finite_period_not_a_permanent_pass():
+    """Tautulli history predating the tracking row must not exempt forever.
+
+    The guard for re-approved users used to `continue` with days_inactive = 0.
+    Because Tautulli's last_seen only moves forward when someone watches, that
+    condition never stopped being true - so a user added after a long absence was
+    never warned and never removed. The clock now counts from when tracking
+    started.
+    """
+    created = datetime.now(timezone.utc) - timedelta(days=5)
+    h = _Harness(
+        users=[{
+            "plex_username": "fresh",
+            "discord_id": 1,
+            "created_at": created,
+            "last_watched": None,
+        }],
+        # last watched 91 days ago, well before the tracking row existed
+        tautulli_rows=[_u("a", 900), _u("b", 800), _u("c", 700),
+                       {"friendly_name": "fresh", "duration": 10,
+                        "last_seen": _seen(91)}],
+    )
+    rows = h.run()
+    assert h.removed == [], "5 days into a 30-day period; not yet removable"
+    assert h.warned == []
+    assert rows["fresh"]["days_inactive"] == 5, (
+        f"expected 5 days counted from tracking start, got "
+        f"{rows['fresh']['days_inactive']} - 0 would mean a permanent pass"
+    )
+
+
+def test_that_period_does_eventually_expire():
+    created = datetime.now(timezone.utc) - timedelta(days=40)
+    h = _Harness(
+        users=[{
+            "plex_username": "lapsed",
+            "discord_id": 1,
+            "created_at": created,
+            "last_watched": None,
+            "warning_sent": True,
+        }],
+        tautulli_rows=[_u("a", 900), _u("b", 800), _u("c", 700),
+                       {"friendly_name": "lapsed", "duration": 10,
+                        "last_seen": _seen(200)}],
+    )
+    h.run()
+    assert h.removed == ["lapsed"], (
+        f"40 days after tracking started, removal is due; got warned={h.warned}"
+    )

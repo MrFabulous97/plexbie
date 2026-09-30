@@ -208,21 +208,28 @@ class UserMgmtCog(commands.Cog):
                     last_watched = datetime.fromtimestamp(int(last_played), tz=timezone.utc)
                     created_at = tracked_user.created_at.replace(tzinfo=timezone.utc) if tracked_user.created_at.tzinfo is None else tracked_user.created_at
 
-                    # Ignore historical watch activity that predates the current tracking entry.
-                    # This prevents freshly re-approved users from being immediately re-removed
-                    # because Tautulli still reports an older last_seen from before reinvite.
-                    if last_watched < created_at:
-                        tracked_user.days_inactive = 0
-                        tracked_user.warning_sent = False
-                        logger.info(
-                            f"User {tracked_user.plex_username}: ignoring stale Tautulli last_seen {last_watched.isoformat()} before tracking start {created_at.isoformat()}"
-                        )
-                        continue
-
-                    # The clock counts from the later of "last watched" and "lost
-                    # the exemption". That is what makes losing top-three status
-                    # grant a fresh full period even to someone already long idle.
+                    # The clock counts from the latest of three dates, and it must
+                    # always count from *something* - see below.
                     baseline = last_watched
+
+                    # Tautulli keeps history from before this tracking entry
+                    # existed, so a re-approved or newly-tracked user can have a
+                    # last_seen from months ago. Counting from that would remove
+                    # them on their first pass. This used to `continue` with
+                    # days_inactive = 0 instead, which meant such a user was
+                    # exempt *permanently*: last_seen only moves forward when they
+                    # watch, so the condition never stopped being true. Counting
+                    # from when tracking started gives them a real, finite period.
+                    if created_at > baseline:
+                        logger.info(
+                            f"User {tracked_user.plex_username}: Tautulli last_seen "
+                            f"{last_watched.date()} predates tracking start "
+                            f"{created_at.date()}; counting from tracking start"
+                        )
+                        baseline = created_at
+
+                    # Losing a top-three exemption restarts the clock, which is what
+                    # grants a full fresh period even to someone already long idle.
                     lost_at = tracked_user.exemption_lost_at
                     if lost_at is not None:
                         if lost_at.tzinfo is None:
