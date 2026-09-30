@@ -1,6 +1,0 @@
-Syncthing sync test file
-Created: 2026-03-21
-Source: MacBook (via Claude Code)
-
-If you can see this file on your Unraid server, Syncthing is working correctly.
-You can safely delete this file after confirming sync.
