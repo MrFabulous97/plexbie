@@ -3,7 +3,7 @@
 import asyncio
 import json
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional, List, Dict, Any
 from pathlib import Path
 
@@ -15,18 +15,23 @@ from core.logging import get_logger
 from core.permissions import AdminActionView, AdminOnlyView, single_flight
 from core.services import BotServices
 from core.admin_mirror import send_user_dm
-from utils.embeds import create_error_embed
+from utils.embeds import create_error_embed, truncate_field
 from database.request_store import (
+    STATUS_PENDING,
     STATUS_APPROVED,
     STATUS_DECLINED,
     get_request,
     mark_resolved,
+    pending_requests,
     save_request,
 )
 
 logger = get_logger(__name__)
 
 # Storage file for requests
+#: Discord allows 25 embed fields; keep well under it so the footer survives.
+MAX_LISTED_REQUESTS = 15
+
 #: The requests store moved into the database (see database/request_store.py).
 #: The old file is left on disk as a backup and is no longer read or written.
 
@@ -1650,6 +1655,94 @@ class MediaRequestsCog(commands.Cog):
         self.bot.add_view(AdminApprovalView())
         self.bot.add_view(BookAdminApprovalView())
         logger.info("✅ Registered persistent media/book approval views")
+
+    @app_commands.command(name="requests", description="Media requests still awaiting a decision")
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.guild_only()
+    @app_commands.checks.has_permissions(administrator=True)
+    async def list_requests(self, interaction: discord.Interaction):
+        """Show requests with no recorded outcome, newest first.
+
+        Outcome recording started on 2026-09-30. Everything submitted before that
+        has no outcome stored, because nothing ever updated the status field - so
+        this cannot tell an untouched request from one approved months ago. Rather
+        than guess, those are counted separately and each entry carries a link to
+        its approval message, where the presence of buttons is the real answer.
+        """
+        await interaction.response.defer(ephemeral=True)
+
+        try:
+            outstanding = await pending_requests()
+            if not outstanding:
+                await interaction.followup.send(
+                    "✅ Nothing waiting on a decision.", ephemeral=True
+                )
+                return
+
+            def submitted_at(record):
+                stamp = record.get("timestamp")
+                try:
+                    value = datetime.fromisoformat(stamp)
+                except (TypeError, ValueError):
+                    return datetime.min.replace(tzinfo=timezone.utc)
+                return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+
+            ordered = sorted(
+                outstanding.items(), key=lambda kv: submitted_at(kv[1]), reverse=True
+            )
+
+            tracked_from = datetime(2026, 9, 30, tzinfo=timezone.utc)
+            before_tracking = sum(
+                1 for _, record in ordered if submitted_at(record) < tracked_from
+            )
+
+            embed = discord.Embed(
+                title="📥 Requests awaiting a decision",
+                description=f"{len(ordered)} with no recorded outcome",
+                color=discord.Color.blurple(),
+            )
+
+            guild_id = interaction.guild.id if interaction.guild else None
+            channel_id = self.services.config.admin_channel_id
+
+            for message_id, record in ordered[:MAX_LISTED_REQUESTS]:
+                media = record.get("media") or {}
+                title = media.get("title") or media.get("name") or "Unknown"
+                kind = record.get("media_type") or media.get("media_type") or "?"
+                when = submitted_at(record)
+
+                lines = [f"**Type:** {kind}"]
+                if record.get("user_id"):
+                    lines.append(f"**Requested by:** <@{record['user_id']}>")
+                lines.append(f"**Submitted:** <t:{int(when.timestamp())}:R>")
+                if guild_id and channel_id:
+                    lines.append(
+                        f"[Open the approval message]"
+                        f"(https://discord.com/channels/{guild_id}/{channel_id}/{message_id})"
+                    )
+
+                embed.add_field(
+                    name=truncate_field(title, limit=256),
+                    value=truncate_field("\n".join(lines)),
+                    inline=False,
+                )
+
+            notes = []
+            if len(ordered) > MAX_LISTED_REQUESTS:
+                notes.append(f"Showing newest {MAX_LISTED_REQUESTS} of {len(ordered)}")
+            if before_tracking:
+                notes.append(
+                    f"{before_tracking} predate outcome tracking - open the message "
+                    f"to see whether the buttons are still there"
+                )
+            if notes:
+                embed.set_footer(text=" · ".join(notes))
+
+            await interaction.followup.send(embed=embed, ephemeral=True)
+
+        except Exception as e:
+            logger.error(f"Error listing requests: {e}", exc_info=True)
+            await interaction.followup.send(f"❌ Error: {str(e)}", ephemeral=True)
 
     @app_commands.command(name="request", description="Request media (TV, Movie, Audiobook, or Ebook)")
     @app_commands.guild_only()

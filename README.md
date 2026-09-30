@@ -243,6 +243,7 @@ guild-only and every reply is ephemeral unless stated otherwise.
 | `/list-plex-users` | `show?` | Plex accounts; `show: Only malformed accounts` filters to those needing removal |
 | `/list-tracked-users` | | Database view, flagging accounts no longer on Plex |
 | `/manage-links` | | Link or unlink a Discord member and a Plex account |
+| `/requests` | | Requests still awaiting a decision, newest first |
 | `/remove-user` | `plex_username` | Remove from Plex, notify, and drop the tracking row |
 | `/who-invited` | `member` | Who invited this member |
 | `/watchparty-active` | | The watch party in progress |
