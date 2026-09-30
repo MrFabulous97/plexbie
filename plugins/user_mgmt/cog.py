@@ -16,7 +16,9 @@ from core.logging import get_logger
 from core.services import BotServices
 from core.admin_mirror import send_user_dm
 from utils.embeds import truncate_field
+from utils.standings import load_aliases, resolve_alias, top_watchers
 from database.session import get_session
+from plugins.watch_party.models import WatchPartyCredit
 from .models import PlexUser
 
 logger = get_logger(__name__)
@@ -45,6 +47,22 @@ class UserMgmtCog(commands.Cog):
         self.check_inactive_users.cancel()
         self.auto_link_users.cancel()
 
+    @staticmethod
+    def _load_watch_aliases():
+        """Blocking: the alias map used to group watch time by person."""
+        return load_aliases()
+
+    def _is_permanently_exempt(self, user: PlexUser) -> bool:
+        """The server owner is never a removal candidate.
+
+        Their Plex account is the one the bot authenticates *with*; removing it
+        would be nonsense, and removeFriend would fail against the owner anyway.
+        Identified by BOT_OWNER_ID rather than by rank, so it holds even when the
+        owner has not watched anything for months.
+        """
+        owner_id = self.services.config.bot_owner_id
+        return bool(owner_id and user.discord_id == owner_id)
+
     @tasks.loop(hours=24)
     async def check_inactive_users(self):
         """Check all users for inactivity every 24 hours"""
@@ -72,6 +90,32 @@ class UserMgmtCog(commands.Cog):
             # Build lookup by friendly_name (case-insensitive)
             tautulli_lookup = {u.get('friendly_name', '').lower(): u for u in tautulli_users}
 
+            # Standings, for the top-watcher exemption. Computed from the response
+            # already in hand plus watch-party credits, through the same helper the
+            # leaderboard uses, so the two cannot disagree about who is in the top
+            # three. Aliases matter here: a person whose Plex name and Tautulli
+            # friendly_name differ would otherwise be split into two partial totals
+            # and could be ranked out of an exemption they have earned.
+            aliases = await run_blocking(self._load_watch_aliases)
+            async with get_session() as session:
+                credit_rows = await session.execute(
+                    select(WatchPartyCredit.plex_username, WatchPartyCredit.total_duration)
+                )
+                credits = {name: total for name, total in credit_rows.all()}
+
+            top = top_watchers(tautulli_users, aliases, credits)
+            if not top:
+                # No standings means we cannot tell who is exempt. Treating that as
+                # "nobody is exempt" would start every user's clock at once on a
+                # Tautulli hiccup, so do nothing at all this pass.
+                logger.warning(
+                    "Inactivity check skipped: no watch-time standings available, "
+                    "so top-watcher exemptions cannot be determined"
+                )
+                return
+            logger.info(f"Top {len(top)} watchers (exempt from removal): {', '.join(top)}")
+
+
             # Three phases, so that no Discord DM, plex.tv login or Tautulli call
             # happens while a database transaction is open.
             #
@@ -93,7 +137,8 @@ class UserMgmtCog(commands.Cog):
 
             def persisted_fields(user: PlexUser):
                 """The columns this check is allowed to change."""
-                return (user.last_watched, user.days_inactive, user.warning_sent)
+                return (user.last_watched, user.days_inactive, user.warning_sent,
+                        user.is_top_watcher, user.exemption_lost_at)
 
             # Snapshot up front so the write phase can tell what changed, rather
             # than relying on every assignment site below to remember to flag
@@ -106,8 +151,10 @@ class UserMgmtCog(commands.Cog):
 
             # Phase 2: decide. No transaction, no network - the field assignments
             # here are made on detached objects and persisted in phase 4.
+            now = datetime.now(timezone.utc)
             to_warn = []
             to_remove = []
+            to_notify_exemption_lost = []
 
             for tracked_user in tracked_users:
                 # Find corresponding Tautulli user
@@ -117,6 +164,41 @@ class UserMgmtCog(commands.Cog):
                     logger.warning(f"Tracked user {tracked_user.plex_username} not found in Tautulli - skipping (may be new)")
                     # Don't auto-delete - user might just not have watched anything yet
                     continue
+
+                # ---- top-watcher exemption -------------------------------------
+                # Decided before any warning or removal, and recorded, so that
+                # *losing* the exemption can be detected on the pass it happens
+                # rather than merely observing that someone is outside the top three.
+                primary = resolve_alias(tracked_user.plex_username, aliases)
+                exempt = primary in top or self._is_permanently_exempt(tracked_user)
+                just_lost_exemption = bool(tracked_user.is_top_watcher) and not exempt
+
+                if exempt:
+                    if not tracked_user.is_top_watcher:
+                        logger.info(
+                            f"User {tracked_user.plex_username} is now exempt from removal "
+                            f"(top {len(top)} watch time)"
+                        )
+                    tracked_user.is_top_watcher = True
+                    tracked_user.exemption_lost_at = None
+                    # Not on the chop block, so any pending warning is void. Without
+                    # this, re-entering the top three would leave warning_sent set
+                    # and the next drop-out would remove them with no fresh warning.
+                    tracked_user.warning_sent = False
+                elif just_lost_exemption:
+                    tracked_user.is_top_watcher = False
+                    tracked_user.exemption_lost_at = now
+                    tracked_user.warning_sent = False
+                    to_notify_exemption_lost.append(tracked_user)
+                    logger.info(
+                        f"User {tracked_user.plex_username} dropped out of the top "
+                        f"{len(top)}; inactivity clock restarts now"
+                    )
+
+                # A user who is exempt, or who lost it on this very pass, is not a
+                # warning or removal candidate. Activity figures are still updated
+                # below so the admin views stay truthful.
+                skip_enforcement = exempt or just_lost_exemption
 
                 # Get last watched from Tautulli
                 last_played = tautulli_user.get('last_seen')
@@ -137,9 +219,22 @@ class UserMgmtCog(commands.Cog):
                         )
                         continue
 
-                    days_since = (datetime.now(timezone.utc) - last_watched).days
+                    # The clock counts from the later of "last watched" and "lost
+                    # the exemption". That is what makes losing top-three status
+                    # grant a fresh full period even to someone already long idle.
+                    baseline = last_watched
+                    lost_at = tracked_user.exemption_lost_at
+                    if lost_at is not None:
+                        if lost_at.tzinfo is None:
+                            lost_at = lost_at.replace(tzinfo=timezone.utc)
+                        if lost_at > baseline:
+                            baseline = lost_at
 
-                    # Update tracked user
+                    days_since = (now - baseline).days
+
+                    # Update tracked user. last_watched stays the real viewing date;
+                    # days_inactive is measured from the baseline, because that is
+                    # the number the warning and removal thresholds act on.
                     tracked_user.last_watched = last_watched
                     tracked_user.days_inactive = days_since
 
@@ -148,6 +243,13 @@ class UserMgmtCog(commands.Cog):
                     # the warning below cannot desynchronize.
                     if days_since < self.services.config.inactivity_warning_days:
                         tracked_user.warning_sent = False
+
+                    if skip_enforcement:
+                        logger.info(
+                            f"User {tracked_user.plex_username}: {days_since} days "
+                            f"inactive (exempt from removal)"
+                        )
+                        continue
 
                     logger.info(f"User {tracked_user.plex_username}: {days_since} days inactive")
 
@@ -175,8 +277,18 @@ class UserMgmtCog(commands.Cog):
                     else:
                         # Existing user with no new activity
                         last_watched_aware = tracked_user.last_watched.replace(tzinfo=timezone.utc) if tracked_user.last_watched.tzinfo is None else tracked_user.last_watched
-                        days_since = (datetime.now(timezone.utc) - last_watched_aware).days
+                        baseline = last_watched_aware
+                        lost_at = tracked_user.exemption_lost_at
+                        if lost_at is not None:
+                            if lost_at.tzinfo is None:
+                                lost_at = lost_at.replace(tzinfo=timezone.utc)
+                            if lost_at > baseline:
+                                baseline = lost_at
+                        days_since = (now - baseline).days
                         tracked_user.days_inactive = days_since
+
+                        if skip_enforcement:
+                            continue
 
                         # Same warn-then-remove sequencing as the branch above.
                         if days_since >= self.services.config.inactivity_warning_days and not tracked_user.warning_sent:
@@ -188,6 +300,9 @@ class UserMgmtCog(commands.Cog):
                             continue
 
             # Phase 3: the slow part, with nothing held open.
+            for tracked_user in to_notify_exemption_lost:
+                await self._send_exemption_lost_dm(tracked_user)
+
             for tracked_user in to_warn:
                 await self._send_warning_dm(tracked_user)
                 # Set unconditionally, as before: _send_warning_dm swallows its own
@@ -217,6 +332,8 @@ class UserMgmtCog(commands.Cog):
                                 last_watched=tracked_user.last_watched,
                                 days_inactive=tracked_user.days_inactive,
                                 warning_sent=tracked_user.warning_sent,
+                                is_top_watcher=tracked_user.is_top_watcher,
+                                exemption_lost_at=tracked_user.exemption_lost_at,
                             )
                         )
                 await session.commit()
@@ -403,6 +520,76 @@ class UserMgmtCog(commands.Cog):
             logger.warning(f"Cannot DM user {user.discord_username} - DMs are disabled")
         except Exception as e:
             logger.error(f"Error sending warning DM to {user.plex_username}: {e}")
+
+    async def _send_exemption_lost_dm(self, user: PlexUser):
+        """Tell a user their top-three exemption has ended and the clock restarts.
+
+        Sent on the pass they drop out, before any warning, and deliberately even
+        when they are already long past the removal threshold - that case is the
+        whole point of the message: they were shielded by their watch time, and now
+        they are not, so they get a full fresh period rather than an immediate
+        removal.
+        """
+        if not user.discord_id:
+            logger.warning(
+                f"Cannot tell {user.plex_username} they lost their exemption: "
+                f"no Discord account linked"
+            )
+            return
+
+        removal_days = self.services.config.inactivity_removal_days
+        warning_days = self.services.config.inactivity_warning_days
+
+        try:
+            discord_user = await self.bot.fetch_user(user.discord_id)
+
+            embed = discord.Embed(
+                title="📉 You're no longer exempt from inactivity removal",
+                description=(
+                    "You've dropped out of the **top 3** watch time on the Plex "
+                    "server, so the inactivity exemption that came with it no "
+                    "longer applies."
+                ),
+                color=discord.Color.orange(),
+            )
+            embed.add_field(
+                name="Your timer starts now",
+                value=(
+                    f"You have a fresh **{removal_days} days** from today, however "
+                    f"long it has been since you last watched something. "
+                    f"We'll warn you at **{warning_days} days** if you're heading "
+                    f"towards removal."
+                ),
+                inline=False,
+            )
+            embed.add_field(
+                name="Want the exemption back?",
+                value=(
+                    "Watch enough to climb back into the top 3 and you're off the "
+                    "chop block again."
+                ),
+                inline=False,
+            )
+            embed.set_footer(text="This is an automated message from Plexbie")
+
+            await send_user_dm(
+                self.bot,
+                self.services,
+                discord_user,
+                context=f"top-three exemption lost for {user.plex_username}",
+                embed=embed,
+            )
+            logger.info(
+                f"Told {user.plex_username} (Discord: {user.discord_username}) "
+                f"that their top-three exemption ended"
+            )
+
+        except discord.Forbidden:
+            logger.warning(f"Cannot DM user {user.discord_username} - DMs are disabled")
+        except Exception as e:
+            logger.error(
+                f"Error sending exemption-lost DM to {user.plex_username}: {e}"
+            )
 
     async def _remove_inactive_user(self, user: PlexUser, plex_user_id: int) -> bool:
         """Remove user from Plex and send farewell. True if the row should be deleted.
@@ -839,8 +1026,10 @@ class UserMgmtCog(commands.Cog):
             logger.error(f"Error listing tracked users: {e}", exc_info=True)
             await interaction.followup.send(f"❌ Error: {str(e)}", ephemeral=True)
 
-    #: Accounts never listed as needing removal. ID 1 is the server owner.
-    PROTECTED_PLEX_ACCOUNT_IDS = (1,)
+    #: Accounts never listed as needing removal. 1 is the server owner; 0 is Plex's
+    #: own /accounts/0 sentinel, which has no name and is not a user at all - it was
+    #: being reported for manual removal, which nobody can action.
+    PROTECTED_PLEX_ACCOUNT_IDS = (0, 1)
 
     @staticmethod
     def _plex_account_problems(account) -> list:

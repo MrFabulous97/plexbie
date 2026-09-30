@@ -29,8 +29,44 @@ async def init_database(db_url: str):
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
         await _migrate_kv_unique(conn)
+        await _migrate_add_columns(conn)
 
     logger.info("Database initialized")
+
+
+#: Columns added to tables that already existed in the wild. create_all() only
+#: applies a model's columns when it creates the table, so a new field never
+#: reaches an existing database - which is how watch_party_credits ended up with
+#: both `last_credited_at` (the model) and `last_credit_at` (added by hand).
+#: Entries are (table, column, DDL type with any default).
+_ADDED_COLUMNS = (
+    ("plex_users", "is_top_watcher", "BOOLEAN NOT NULL DEFAULT 0"),
+    ("plex_users", "exemption_lost_at", "DATETIME"),
+)
+
+
+async def _migrate_add_columns(conn):
+    """Add any model column the database is missing. Idempotent.
+
+    Deliberately additive only: it never drops or retypes anything, so running it
+    against an unexpected schema cannot lose data. Failure is logged and
+    swallowed - a missing column surfaces as a clear error from the query that
+    needs it, which is easier to diagnose than a bot that will not start.
+    """
+    for table, column, ddl in _ADDED_COLUMNS:
+        try:
+            result = await conn.execute(text(f"PRAGMA table_info('{table}')"))
+            existing = {row[1] for row in result}
+            if not existing:
+                # Table absent entirely; create_all will have made it from the
+                # model, columns included.
+                continue
+            if column in existing:
+                continue
+            await conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}"))
+            logger.info(f"Added missing column {table}.{column}")
+        except Exception as e:
+            logger.error(f"Could not add column {table}.{column}: {e}")
 
 
 async def _migrate_kv_unique(conn):

@@ -33,6 +33,13 @@ class PlexUser(Base):
     days_inactive: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     warning_sent: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
+    # Top-watcher exemption. is_top_watcher records the standing observed on the
+    # last pass, so that *dropping out* can be detected rather than merely being
+    # outside the top three. exemption_lost_at is when that happened, and becomes
+    # the baseline the inactivity clock counts from.
+    is_top_watcher: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    exemption_lost_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
     # Timestamps
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, onupdate=utc_now, nullable=False)

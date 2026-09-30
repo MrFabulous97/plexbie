@@ -12,6 +12,7 @@ from discord.ext import commands, tasks
 from core.blocking import run_blocking
 from utils.formatting import episode_label
 from utils.embeds import truncate_field
+from utils.standings import ALIASES_FILE, merge_aliased_users
 from core.logging import get_logger
 from core.services import BotServices
 from database.session import get_session
@@ -25,7 +26,8 @@ logger = get_logger(__name__)
 # Storage files
 STREAKS_FILE = Path("config/watch_streaks.json")
 MESSAGE_IDS_FILE = Path("config/stats_messages.json")
-USER_ALIASES_FILE = Path("config/user_aliases.json")
+#: Imported so there is one definition of this path - utils.standings owns it.
+USER_ALIASES_FILE = ALIASES_FILE
 
 # Latency compensation for Discord timestamp display (in seconds)
 # This offset is added to timestamps to compensate for network latency,
@@ -239,32 +241,14 @@ class WatchTrackingCog(commands.Cog):
         return aliases.get(username, username)
 
     def _apply_aliases_to_users(self, users: List[dict]) -> List[dict]:
-        """Combine watch times for aliased users"""
-        aliases = self._load_aliases()
-        if not aliases:
-            return users
+        """Combine watch times for aliased users.
 
-        # Group users by their primary name
-        combined: Dict[str, dict] = {}
-        for user in users:
-            friendly_name = user.get('friendly_name', 'Unknown')
-            # Map to primary name if aliased
-            primary_name = aliases.get(friendly_name, friendly_name)
-
-            if primary_name in combined:
-                # Add to existing entry
-                combined[primary_name]['duration'] = combined[primary_name].get('duration', 0) + user.get('duration', 0)
-                combined[primary_name]['plays'] = combined[primary_name].get('plays', 0) + user.get('plays', 0)
-            else:
-                # Create new entry with primary name
-                combined[primary_name] = {
-                    'friendly_name': primary_name,
-                    'duration': user.get('duration', 0),
-                    'plays': user.get('plays', 0),
-                    'user_id': user.get('user_id')
-                }
-
-        return list(combined.values())
+        Delegates to utils.standings so that the leaderboard and the inactivity
+        check's top-watcher exemption compute the same totals. They must agree:
+        otherwise someone gets removed while the board still shows them in the top
+        three.
+        """
+        return merge_aliased_users(users, self._load_aliases())
 
     async def _get_watch_party_credits(self) -> Dict[str, int]:
         """Get aggregated watch party credits by plex_username"""
@@ -521,6 +505,28 @@ class WatchTrackingCog(commands.Cog):
                 else:
                     if streaks[username]['last_watched'] != yesterday:
                         streaks[username]['current'] = 0
+
+            # Drop entries for accounts Plex no longer reports. Nothing else ever
+            # removed them, so the file had accumulated seven ghosts - renamed
+            # accounts, removed users, and one empty-string key left by Plex's
+            # nameless /accounts/0 sentinel, which _collect_watched_today now skips.
+            # watched_by_user is keyed by every current account name, so it is the
+            # authority on what should still be here.
+            # Only prune when Plex actually reported accounts. An empty result is
+            # not evidence that everyone left, and wiping the whole history would
+            # be far worse than keeping a ghost for another hour.
+            ghosts = (
+                [name for name in streaks if name not in watched_by_user]
+                if watched_by_user else []
+            )
+            for name in ghosts:
+                del streaks[name]
+            if ghosts:
+                logger.info(
+                    f"Pruned {len(ghosts)} streak entr{'y' if len(ghosts) == 1 else 'ies'} "
+                    f"for accounts no longer on Plex: "
+                    f"{', '.join(repr(g) for g in sorted(ghosts))}"
+                )
 
             STREAKS_FILE.write_text(json.dumps(streaks, indent=2))
 
